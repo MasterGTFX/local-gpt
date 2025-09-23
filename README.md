@@ -19,7 +19,7 @@ A local web interface for chatting with Large Language Models similar to ChatGPT
 ## Technology Stack
 
 ### Backend
-- **Python 3.9+**: Core application
+- **Python 3.10+**: Core application
 - **Gradio**: Web UI framework
 - **SQLAlchemy**: Database ORM
 - **OpenRouter**: Multi-model LLM access

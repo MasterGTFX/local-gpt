@@ -4,6 +4,7 @@ import gradio as gr
 from dotenv import load_dotenv
 from typing import List, Dict, Tuple, Optional
 from database import DatabaseService
+from user_preferences import get_preference, set_preference, load_preferences
 
 # Load environment variables
 load_dotenv()
@@ -19,6 +20,7 @@ selected_model = None
 db_service: Optional[DatabaseService] = None
 current_conversation_id: Optional[str] = None
 current_model_choice = ""
+user_preferences = {}
 
 def fetch_available_models() -> List[Dict]:
     """Fetch available models from LLM API"""
@@ -136,9 +138,93 @@ def ensure_conversation() -> str:
 
     return current_conversation_id
 
+def generate_conversation_title(content: str) -> str:
+    """Generate conversation title from first 3 words of user message"""
+    if not content or not content.strip():
+        return "New Conversation"
+
+    words = content.strip().split()[:3]
+    return " ".join(words) if words else "New Conversation"
+
+def load_conversations_list() -> List[Tuple[str, str]]:
+    """Load conversations for Radio component"""
+    global db_service
+
+    if not db_service:
+        return []
+
+    try:
+        conversations = db_service.get_recent_conversations(limit=20)
+        if not conversations:
+            return []
+
+        choices = []
+        for conv in conversations:
+            title = conv.get('title', 'New Conversation')
+            conv_id = conv.get('id', '')
+            updated_at = conv.get('updated_at')
+
+            # Format timestamp
+            time_str = ""
+            if updated_at:
+                try:
+                    from datetime import datetime
+                    if isinstance(updated_at, str):
+                        dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+                    else:
+                        dt = updated_at
+                    time_str = dt.strftime("%m/%d %H:%M")
+                except:
+                    time_str = ""
+
+            # Create display name with timestamp
+            display_name = f"{title}" + (f" ({time_str})" if time_str else "")
+            choices.append((display_name, conv_id))
+
+        return choices
+
+    except Exception as e:
+        print(f"Error loading conversations: {e}")
+        return []
+
+def load_conversation_messages(conversation_id: str) -> List[Dict[str, str]]:
+    """Load conversation messages in Gradio format"""
+    global db_service
+
+    if not db_service or not conversation_id:
+        return []
+
+    try:
+        # Get messages using the existing database method
+        messages = db_service.get_conversation_messages(conversation_id)
+
+        # Convert from old format [(user_msg, assistant_msg)] to new messages format
+        gradio_messages = []
+        for user_msg, assistant_msg in messages:
+            gradio_messages.append({"role": "user", "content": user_msg})
+            gradio_messages.append({"role": "assistant", "content": assistant_msg})
+
+        return gradio_messages
+
+    except Exception as e:
+        print(f"Error loading conversation messages: {e}")
+        return []
+
+def toggle_sidebar_visibility(visible: bool):
+    """Toggle sidebar visibility and save preference"""
+    new_visible = not visible
+    set_preference("sidebar_visible", new_visible)
+    return new_visible, new_visible
+
+def start_new_conversation() -> List[Dict[str, str]]:
+    """Start a new conversation and return empty chat history"""
+    global current_conversation_id
+    current_conversation_id = None  # Will be created when first message is sent
+    return []
+
 def chat_function(message: str, history: List[Dict[str, str]], model_choice: str) -> Tuple[str, List[Dict[str, str]]]:
     """Handle chat messages"""
-    global db_service
+    global db_service, current_conversation_id
 
     if not LLM_API_KEY:
         error_msg = {"role": "assistant", "content": "Error: Please set your LLM_API_KEY in the .env file"}
@@ -155,6 +241,14 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
 
     # Ensure we have a conversation to save to
     conversation_id = ensure_conversation()
+
+    # If this is the first message in a new conversation, set the title
+    if db_service and conversation_id and len(history) == 0:
+        title = generate_conversation_title(message)
+        try:
+            db_service.set_conversation_title(conversation_id, title)
+        except Exception as e:
+            print(f"Error setting conversation title: {e}")
 
     # Add user message to history
     user_message = {"role": "user", "content": message}
@@ -186,45 +280,88 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
 
 def create_interface():
     """Create the Gradio interface"""
+    global user_preferences
+    initial_sidebar_visible = user_preferences.get("sidebar_visible", True)
+
     with gr.Blocks(title="Local GPT Chat", theme=gr.themes.Soft()) as demo:
-        # Header with model selection
+        # State for sidebar visibility
+        sidebar_visible = gr.State(initial_sidebar_visible)
+
+        # Main layout container
         with gr.Row():
-            with gr.Column(scale=1):
-                gr.Markdown("# 🤖 Local GPT Chat")
-            with gr.Column(scale=1):
-                model_dropdown = gr.Dropdown(
-                    choices=get_model_choices(),
-                    value=get_model_choices()[0] if get_model_choices() != ["No models available"] else None,
-                    label="Model",
+            # Left sidebar for conversations
+            with gr.Column(scale=1, visible=initial_sidebar_visible) as sidebar:
+                # New Chat button
+                new_chat_btn = gr.Button("+ New Chat", variant="primary", size="lg")
+
+                # Conversations list
+                conversations_radio = gr.Radio(
+                    choices=[],
+                    label="Recent Conversations",
                     interactive=True,
-                    container=False
+                    container=True
                 )
 
-        # Main chat interface
-        chatbot = gr.Chatbot(
-            type="messages",
-            value=[],
-            height=600,
-            show_label=False,
-            container=False,
-            editable="all",
-            show_copy_button=True
-        )
+                # Hide sidebar button
+                hide_sidebar_btn = gr.Button("Hide", variant="secondary", size="sm")
 
-        # Input area at bottom
-        with gr.Row():
-            msg_input = gr.Textbox(
-                placeholder="Message Local GPT...",
-                show_label=False,
-                scale=8,
-                container=False
-            )
-            send_btn = gr.Button("Send", scale=1, variant="primary")
-            clear_btn = gr.Button("Clear", scale=1, variant="secondary")
+            # Right main content area
+            with gr.Column(scale=3) as main_content:
+                # Header with model selection and show sidebar button
+                with gr.Row():
+                    show_sidebar_btn = gr.Button("☰", variant="secondary", size="sm", visible=not initial_sidebar_visible, scale=1)
+                    with gr.Column(scale=8):
+                        gr.Markdown("# 🤖 Local GPT Chat")
+                    with gr.Column(scale=3):
+                        # Get saved model preference or default to first available
+                        saved_model = user_preferences.get("last_selected_model")
+                        model_choices = get_model_choices()
+                        default_model = None
 
-        # Model info in a collapsible section
-        with gr.Accordion("Model Information", open=False):
-            model_info = gr.Markdown("Select a model to see its description.")
+                        if saved_model and saved_model in model_choices:
+                            default_model = saved_model
+                        elif model_choices != ["No models available"]:
+                            default_model = model_choices[0]
+
+                        model_dropdown = gr.Dropdown(
+                            choices=model_choices,
+                            value=default_model,
+                            label="Model",
+                            interactive=True,
+                            container=False
+                        )
+
+                # Main chat interface
+                chatbot = gr.Chatbot(
+                    type="messages",
+                    value=[],
+                    height=600,
+                    show_label=False,
+                    container=False,
+                    editable="all",
+                    show_copy_button=True
+                )
+
+                # Input area at bottom
+                with gr.Row():
+                    msg_input = gr.Textbox(
+                        placeholder="Message Local GPT...",
+                        show_label=False,
+                        scale=8,
+                        container=False
+                    )
+                    send_btn = gr.Button("Send", scale=1, variant="primary")
+                    clear_btn = gr.Button("Clear", scale=1, variant="secondary")
+
+                # Model info in a collapsible section
+                with gr.Accordion("Model Information", open=False):
+                    model_info = gr.Markdown("Select a model to see its description.")
+
+        # State to track selected conversation ID
+        selected_conversation_id = gr.State("")
+
+        # Hidden button for conversation loading
+        load_conversation_btn = gr.Button("Load Conversation", visible=False)
 
         # Event handlers
         def update_model_info(model_choice):
@@ -313,7 +450,20 @@ def create_interface():
             """Update the current model choice for retry functionality"""
             global current_model_choice
             current_model_choice = model_choice
+            # Save model preference
+            set_preference("last_selected_model", model_choice)
             return update_model_info(model_choice)
+
+        def load_conversation_by_id(conversation_id: str) -> Tuple[List[Dict[str, str]], str]:
+            """Load a specific conversation by ID"""
+            global current_conversation_id
+            current_conversation_id = conversation_id
+            messages = load_conversation_messages(conversation_id)
+            return messages, load_conversations_list()
+
+        def create_conversation_handler(conv_id: str):
+            """Create a handler function for a specific conversation ID"""
+            return lambda: load_conversation_by_id(conv_id)
 
         model_dropdown.change(
             update_current_model,
@@ -325,18 +475,63 @@ def create_interface():
             chat_function,
             inputs=[msg_input, chatbot, model_dropdown],
             outputs=[msg_input, chatbot]
+        ).then(
+            lambda: gr.update(choices=load_conversations_list()),
+            outputs=[conversations_radio]
         )
 
         msg_input.submit(
             chat_function,
             inputs=[msg_input, chatbot, model_dropdown],
             outputs=[msg_input, chatbot]
+        ).then(
+            lambda: gr.update(choices=load_conversations_list()),
+            outputs=[conversations_radio]
         )
 
         clear_btn.click(
             clear_conversation,
             inputs=[],
             outputs=[chatbot]
+        ).then(
+            lambda: gr.update(choices=load_conversations_list(), value=None),
+            outputs=[conversations_radio]
+        )
+
+        new_chat_btn.click(
+            start_new_conversation,
+            inputs=[],
+            outputs=[chatbot]
+        ).then(
+            lambda: gr.update(choices=load_conversations_list(), value=None),
+            outputs=[conversations_radio]
+        )
+
+        # Conversation selection handler
+        conversations_radio.change(
+            lambda selected: load_conversation_messages(selected) if selected else [],
+            inputs=[conversations_radio],
+            outputs=[chatbot]
+        )
+
+        hide_sidebar_btn.click(
+            toggle_sidebar_visibility,
+            inputs=[sidebar_visible],
+            outputs=[sidebar_visible, show_sidebar_btn]
+        ).then(
+            lambda visible: gr.update(visible=visible),
+            inputs=[sidebar_visible],
+            outputs=[sidebar]
+        )
+
+        show_sidebar_btn.click(
+            toggle_sidebar_visibility,
+            inputs=[sidebar_visible],
+            outputs=[sidebar_visible, show_sidebar_btn]
+        ).then(
+            lambda visible: gr.update(visible=visible),
+            inputs=[sidebar_visible],
+            outputs=[sidebar]
         )
 
         # Wire up chatbot event handlers
@@ -358,7 +553,12 @@ def create_interface():
             outputs=[chatbot]
         )
 
-
+        # Initialize conversations list on startup
+        demo.load(
+            lambda: gr.update(choices=load_conversations_list()),
+            inputs=[],
+            outputs=[conversations_radio]
+        )
 
     return demo
 
@@ -372,6 +572,11 @@ def main():
         return
 
     print("🚀 Starting Local GPT Chat...")
+
+    # Load user preferences
+    global user_preferences
+    user_preferences = load_preferences()
+    print(f"📋 Loaded user preferences: {len(user_preferences)} settings")
 
     # Initialize database if DATABASE_URL is provided
     if os.getenv("DATABASE_URL"):

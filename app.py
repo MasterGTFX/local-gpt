@@ -146,7 +146,7 @@ def generate_conversation_title(content: str) -> str:
     words = content.strip().split()[:3]
     return " ".join(words) if words else "New Conversation"
 
-def load_conversations_list() -> List[Tuple[str, str]]:
+def load_conversations_list(search_query: str = "") -> List[Tuple[str, str]]:
     """Load conversations for Radio component"""
     global db_service
 
@@ -154,7 +154,11 @@ def load_conversations_list() -> List[Tuple[str, str]]:
         return []
 
     try:
-        conversations = db_service.get_recent_conversations(limit=20)
+        if search_query and search_query.strip():
+            conversations = db_service.search_conversations(search_query, limit=20)
+        else:
+            conversations = db_service.get_recent_conversations(limit=20)
+
         if not conversations:
             return []
 
@@ -177,8 +181,13 @@ def load_conversations_list() -> List[Tuple[str, str]]:
                 except:
                     time_str = ""
 
-            # Create display name with timestamp
-            display_name = f"{title}" + (f" ({time_str})" if time_str else "")
+            # Truncate long titles to prevent overflow
+            max_title_length = 25
+            if len(title) > max_title_length:
+                title = title[:max_title_length] + "..."
+
+            # Create compact display name with timestamp
+            display_name = f"{title}\n{time_str}" if time_str else title
             choices.append((display_name, conv_id))
 
         return choices
@@ -281,37 +290,55 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
 def create_interface():
     """Create the Gradio interface"""
     global user_preferences
-    initial_sidebar_visible = user_preferences.get("sidebar_visible", True)
 
-    with gr.Blocks(title="Local GPT Chat", theme=gr.themes.Soft()) as demo:
-        # State for sidebar visibility
+    # Always load latest preferences
+    user_preferences = load_preferences()
+
+    initial_sidebar_visible = user_preferences.get("sidebar_visible", True)
+    theme_preference = user_preferences.get("theme_preference", "light")
+
+    # Set theme based on preference
+    if theme_preference == "dark":
+        theme = gr.themes.Monochrome()
+    else:
+        theme = gr.themes.Glass()
+
+    with gr.Blocks(title="Local GPT Chat", theme=theme) as demo:
+        # State for sidebar visibility and theme
         sidebar_visible = gr.State(initial_sidebar_visible)
+        current_theme = gr.State(theme_preference)
 
         # Main layout container
         with gr.Row():
             # Left sidebar for conversations
-            with gr.Column(scale=1, visible=initial_sidebar_visible) as sidebar:
+            with gr.Column(scale=1, visible=initial_sidebar_visible, min_width=250) as sidebar:
                 # New Chat button
                 new_chat_btn = gr.Button("+ New Chat", variant="primary", size="lg")
+
+                # Search conversations
+                search_input = gr.Textbox(
+                    placeholder="🔍 Search conversations...",
+                    show_label=False,
+                    container=False,
+                    scale=1
+                )
 
                 # Conversations list
                 conversations_radio = gr.Radio(
                     choices=[],
                     label="Recent Conversations",
                     interactive=True,
-                    container=True
+                    container=False
                 )
-
-                # Hide sidebar button
-                hide_sidebar_btn = gr.Button("Hide", variant="secondary", size="sm")
 
             # Right main content area
             with gr.Column(scale=3) as main_content:
-                # Header with model selection and show sidebar button
+                # Header with model selection, theme toggle, and sidebar toggle button
                 with gr.Row():
-                    show_sidebar_btn = gr.Button("☰", variant="secondary", size="sm", visible=not initial_sidebar_visible, scale=1)
+                    sidebar_toggle_btn = gr.Button("« Hide Chat History" if initial_sidebar_visible else "» Show Chat History", variant="secondary", size="sm", scale=1)
+                    theme_toggle_btn = gr.Button("🌙" if theme_preference == "light" else "☀️", variant="secondary", size="sm", scale=1)
                     with gr.Column(scale=8):
-                        gr.Markdown("# 🤖 Local GPT Chat")
+                        gr.HTML("<h1 style='text-align: center;'>🤖 Local GPT Chat</h1>")
                     with gr.Column(scale=3):
                         # Get saved model preference or default to first available
                         saved_model = user_preferences.get("last_selected_model")
@@ -454,16 +481,20 @@ def create_interface():
             set_preference("last_selected_model", model_choice)
             return update_model_info(model_choice)
 
-        def load_conversation_by_id(conversation_id: str) -> Tuple[List[Dict[str, str]], str]:
+        def load_conversation_by_id(conversation_id: str, search_query: str = "") -> Tuple[List[Dict[str, str]], List[Tuple[str, str]]]:
             """Load a specific conversation by ID"""
             global current_conversation_id
             current_conversation_id = conversation_id
             messages = load_conversation_messages(conversation_id)
-            return messages, load_conversations_list()
+            return messages, load_conversations_list(search_query)
 
         def create_conversation_handler(conv_id: str):
             """Create a handler function for a specific conversation ID"""
             return lambda: load_conversation_by_id(conv_id)
+
+        def handle_search(search_query: str):
+            """Handle conversation search"""
+            return gr.update(choices=load_conversations_list(search_query))
 
         model_dropdown.change(
             update_current_model,
@@ -476,7 +507,8 @@ def create_interface():
             inputs=[msg_input, chatbot, model_dropdown],
             outputs=[msg_input, chatbot]
         ).then(
-            lambda: gr.update(choices=load_conversations_list()),
+            lambda search_query: gr.update(choices=load_conversations_list(search_query)),
+            inputs=[search_input],
             outputs=[conversations_radio]
         )
 
@@ -485,7 +517,8 @@ def create_interface():
             inputs=[msg_input, chatbot, model_dropdown],
             outputs=[msg_input, chatbot]
         ).then(
-            lambda: gr.update(choices=load_conversations_list()),
+            lambda search_query: gr.update(choices=load_conversations_list(search_query)),
+            inputs=[search_input],
             outputs=[conversations_radio]
         )
 
@@ -494,7 +527,8 @@ def create_interface():
             inputs=[],
             outputs=[chatbot]
         ).then(
-            lambda: gr.update(choices=load_conversations_list(), value=None),
+            lambda search_query: gr.update(choices=load_conversations_list(search_query), value=None),
+            inputs=[search_input],
             outputs=[conversations_radio]
         )
 
@@ -503,35 +537,64 @@ def create_interface():
             inputs=[],
             outputs=[chatbot]
         ).then(
-            lambda: gr.update(choices=load_conversations_list(), value=None),
+            lambda search_query: gr.update(choices=load_conversations_list(search_query), value=None),
+            inputs=[search_input],
             outputs=[conversations_radio]
         )
 
         # Conversation selection handler
+        def handle_conversation_selection(selected):
+            """Handle conversation selection and clear search"""
+            if selected:
+                global current_conversation_id
+                current_conversation_id = selected
+                messages = load_conversation_messages(selected)
+                return messages, ""  # Clear search when selecting conversation
+            return [], ""
+
         conversations_radio.change(
-            lambda selected: load_conversation_messages(selected) if selected else [],
+            handle_conversation_selection,
             inputs=[conversations_radio],
-            outputs=[chatbot]
+            outputs=[chatbot, search_input]
+        ).then(
+            lambda: gr.update(choices=load_conversations_list("")),
+            outputs=[conversations_radio]
         )
 
-        hide_sidebar_btn.click(
-            toggle_sidebar_visibility,
+        def handle_sidebar_toggle(visible):
+            new_visible = not visible
+            set_preference("sidebar_visible", new_visible)
+            button_text = "« Hide Chat History" if new_visible else "» Show Chat History"
+            return new_visible, button_text, gr.update(visible=new_visible)
+
+        def handle_theme_toggle(current_theme_val):
+            """Toggle between light and dark theme"""
+            new_theme = "dark" if current_theme_val == "light" else "light"
+            set_preference("theme_preference", new_theme)
+            new_button_text = "🌙" if new_theme == "light" else "☀️"
+
+            # Show meaningful notification about theme change
+            theme_name = "dark" if new_theme == "dark" else "light"
+            gr.Info(f"Switched to {theme_name} theme! Please refresh the page to see the change.")
+
+            return new_theme, new_button_text
+
+        sidebar_toggle_btn.click(
+            handle_sidebar_toggle,
             inputs=[sidebar_visible],
-            outputs=[sidebar_visible, show_sidebar_btn]
-        ).then(
-            lambda visible: gr.update(visible=visible),
-            inputs=[sidebar_visible],
-            outputs=[sidebar]
+            outputs=[sidebar_visible, sidebar_toggle_btn, sidebar]
         )
 
-        show_sidebar_btn.click(
-            toggle_sidebar_visibility,
-            inputs=[sidebar_visible],
-            outputs=[sidebar_visible, show_sidebar_btn]
-        ).then(
-            lambda visible: gr.update(visible=visible),
-            inputs=[sidebar_visible],
-            outputs=[sidebar]
+        theme_toggle_btn.click(
+            handle_theme_toggle,
+            inputs=[current_theme],
+            outputs=[current_theme, theme_toggle_btn]
+        )
+
+        search_input.change(
+            handle_search,
+            inputs=[search_input],
+            outputs=[conversations_radio]
         )
 
         # Wire up chatbot event handlers
@@ -555,7 +618,7 @@ def create_interface():
 
         # Initialize conversations list on startup
         demo.load(
-            lambda: gr.update(choices=load_conversations_list()),
+            lambda: gr.update(choices=load_conversations_list("")),
             inputs=[],
             outputs=[conversations_radio]
         )
@@ -571,39 +634,39 @@ def main():
         print("Please copy .env.example to .env and add your LLM API key")
         return
 
-    print("🚀 Starting Local GPT Chat...")
+    print("Starting Local GPT Chat...")
 
     # Load user preferences
     global user_preferences
     user_preferences = load_preferences()
-    print(f"📋 Loaded user preferences: {len(user_preferences)} settings")
+    print(f"Loaded user preferences: {len(user_preferences)} settings")
 
     # Initialize database if DATABASE_URL is provided
     if os.getenv("DATABASE_URL"):
         try:
-            print("🗄️  Initializing database...")
+            print("Initializing database...")
             db_service = DatabaseService()
             db_service.init_db()
-            print("✅ Database initialized successfully")
+            print("Database initialized successfully")
         except Exception as e:
-            print(f"⚠️  Warning: Could not initialize database: {e}")
-            print("💭 Conversations will not be saved")
+            print(f"Warning: Could not initialize database: {e}")
+            print("Conversations will not be saved")
     else:
-        print("⚠️  No DATABASE_URL found. Conversations will not be saved")
+        print("No DATABASE_URL found. Conversations will not be saved")
 
-    print(f"📡 Fetching available models from LLM API...")
+    print(f"Fetching available models from LLM API...")
 
     # Pre-fetch models to show any errors early
     models = fetch_available_models()
     if models:
-        print(f"✅ Found {len(models)} available models")
+        print(f"Found {len(models)} available models")
     else:
-        print("⚠️  Warning: Could not fetch models. Check your API key.")
+        print("Warning: Could not fetch models. Check your API key.")
 
     # Create and launch the interface
     demo = create_interface()
 
-    print(f"🌐 Starting server on http://localhost:{PORT}")
+    print(f"Starting server on http://localhost:{PORT}")
     demo.launch(
         server_name="0.0.0.0",
         server_port=PORT,

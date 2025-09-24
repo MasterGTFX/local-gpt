@@ -116,6 +116,53 @@ class DatabaseService:
 
             return result
 
+    def search_conversations(self, query: str, limit: int = 10) -> List[dict]:
+        """Search conversations by title and message content"""
+        if not query or not query.strip():
+            return self.get_recent_conversations(limit)
+
+        query = query.strip().lower()
+
+        with self.get_session() as session:
+            # Search in conversation titles
+            title_matches = session.query(Conversation).filter(
+                Conversation.title.ilike(f'%{query}%')
+            ).order_by(Conversation.updated_at.desc()).limit(limit).all()
+
+            # Search in message content using JSONB operators
+            content_matches = session.query(Conversation).join(Message).filter(
+                Message.message_data['content'].astext.ilike(f'%{query}%')
+            ).distinct().order_by(Conversation.updated_at.desc()).limit(limit).all()
+
+            # Combine results and remove duplicates
+            all_conversations = {}
+            for conv in title_matches + content_matches:
+                all_conversations[conv.id] = conv
+
+            # Sort by updated_at and limit results
+            sorted_conversations = sorted(
+                all_conversations.values(),
+                key=lambda x: x.updated_at,
+                reverse=True
+            )[:limit]
+
+            result = []
+            for conv in sorted_conversations:
+                # Get first message for title if no title set
+                title = conv.title
+                if not title and conv.messages:
+                    first_msg = conv.messages[0]
+                    if first_msg.role == 'user':
+                        title = first_msg.content_text[:50] + "..." if len(first_msg.content_text) > 50 else first_msg.content_text
+
+                result.append({
+                    'id': str(conv.id),
+                    'title': title or 'New Conversation',
+                    'updated_at': conv.updated_at
+                })
+
+            return result
+
     def set_conversation_title(self, conversation_id: str, title: str):
         """Set the title for a conversation"""
         with self.get_session() as session:

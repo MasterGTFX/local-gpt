@@ -1,0 +1,17 @@
+{
+  "project": "Local GPT Chat",
+  "features": {
+    "file_upload": true,
+    "markdown_conversion": true,
+    "llm_integration": true,
+    "database_storage": true
+  },
+  "supported_formats": [
+    "pdf", "docx", "pptx", "xlsx",
+    "jpg", "png", "gif",
+    "mp3", "wav",
+    "txt", "json", "xml", "csv",
+    "py", "js", "html"
+  ],
+  "status": "implemented"
+}

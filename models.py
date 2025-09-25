@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, DateTime, ForeignKey
+from sqlalchemy import Column, String, DateTime, ForeignKey, Integer, Text
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
@@ -48,3 +48,22 @@ class Message(Base):
     @property
     def tokens_used(self) -> int:
         return self.message_data.get('usage', {}).get('total_tokens', 0)
+
+
+class FileAttachment(Base):
+    __tablename__ = 'file_attachments'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    message_id = Column(UUID(as_uuid=True), ForeignKey('messages.id'))
+    filename = Column(String(255), nullable=False)
+    original_filename = Column(String(255), nullable=False)
+    file_size = Column(Integer, nullable=False)
+    file_hash = Column(String(64), nullable=False, index=True)
+    mime_type = Column(String(100))
+    extension = Column(String(10))
+    markdown_content = Column(Text)
+    content_length = Column(Integer, default=0)
+    processing_metadata = Column(JSONB)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    message = relationship("Message", backref="file_attachments")

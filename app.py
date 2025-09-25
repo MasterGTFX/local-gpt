@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from typing import List, Dict, Tuple, Optional
 from database import DatabaseService
 from user_preferences import get_preference, set_preference, load_preferences
+from file_processor import FileProcessor
 
 # Load environment variables
 load_dotenv()
@@ -13,6 +14,7 @@ load_dotenv()
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 PORT = int(os.getenv("PORT", 7860))
+GRADIO_THEME = os.getenv("GRADIO_THEME", "glass")
 
 # Global variables
 available_models = []
@@ -21,6 +23,7 @@ db_service: Optional[DatabaseService] = None
 current_conversation_id: Optional[str] = None
 current_model_choice = ""
 user_preferences = {}
+file_processor: Optional[FileProcessor] = None
 
 def fetch_available_models() -> List[Dict]:
     """Fetch available models from LLM API"""
@@ -231,22 +234,35 @@ def start_new_conversation() -> List[Dict[str, str]]:
     current_conversation_id = None  # Will be created when first message is sent
     return []
 
-def chat_function(message: str, history: List[Dict[str, str]], model_choice: str) -> Tuple[str, List[Dict[str, str]]]:
-    """Handle chat messages"""
-    global db_service, current_conversation_id
+def chat_function(message: str, history: List[Dict[str, str]], model_choice: str, uploaded_files: List[Dict] = None) -> Tuple[str, List[Dict[str, str]], List[Dict], str]:
+    """Handle chat messages with optional file attachments"""
+    global db_service, current_conversation_id, file_processor
 
     if not LLM_API_KEY:
         error_msg = {"role": "assistant", "content": "Error: Please set your LLM_API_KEY in the .env file"}
-        return "", history + [error_msg]
+        return "", history + [error_msg], [], ""
 
     if not message.strip():
-        return "", history
+        return "", history, uploaded_files or [], ""
 
     if model_choice == "No models available":
         error_msg = {"role": "assistant", "content": "Error: No models available. Please check your API key."}
-        return "", history + [error_msg]
+        return "", history + [error_msg], [], ""
 
     model_id = extract_model_id(model_choice)
+
+    # Process file attachments if any
+    file_context = ""
+    processed_files = uploaded_files or []
+    if processed_files and file_processor:
+        # Format files for LLM context
+        file_context = file_processor.format_files_for_llm_context(processed_files)
+
+    # Prepare the actual message for the LLM (combining user message with file context)
+    if file_context:
+        llm_message = f"{file_context}\n\n[USER MESSAGE]\n{message}"
+    else:
+        llm_message = message
 
     # Ensure we have a conversation to save to
     conversation_id = ensure_conversation()
@@ -259,19 +275,31 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
         except Exception as e:
             print(f"Error setting conversation title: {e}")
 
-    # Add user message to history
+    # Add user message to history (display the original message, not the one with file context)
     user_message = {"role": "user", "content": message}
     updated_history = history + [user_message]
 
-    # Save user message to database
+    # Save user message to database and get message ID for file attachments
+    user_message_id = None
     if db_service and conversation_id:
         try:
-            db_service.save_message(conversation_id, "user", message, model_id)
+            user_message_id = db_service.save_message(conversation_id, "user", message, model_id)
         except Exception as e:
             print(f"Error saving user message: {e}")
 
-    # Convert to OpenAI format and get AI response
-    openai_messages = messages_to_openai_format(updated_history)
+    # Save file attachments to database if any
+    if processed_files and db_service and user_message_id:
+        for file_data in processed_files:
+            if file_data.get('success'):
+                try:
+                    db_service.save_file_attachment(user_message_id, file_data)
+                except Exception as e:
+                    print(f"Error saving file attachment: {e}")
+
+    # Convert to OpenAI format and get AI response (use llm_message with file context)
+    # Create a temporary history with the file context message for the LLM
+    temp_history = history + [{"role": "user", "content": llm_message}]
+    openai_messages = messages_to_openai_format(temp_history)
     response = send_message_to_llm(openai_messages, model_id)
 
     # Add assistant response to history
@@ -285,7 +313,8 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
         except Exception as e:
             print(f"Error saving assistant message: {e}")
 
-    return "", final_history
+    # Clear uploaded files after successful processing and return empty state
+    return "", final_history, [], ""
 
 def create_interface():
     """Create the Gradio interface"""
@@ -295,18 +324,20 @@ def create_interface():
     user_preferences = load_preferences()
 
     initial_sidebar_visible = user_preferences.get("sidebar_visible", True)
-    theme_preference = user_preferences.get("theme_preference", "light")
 
-    # Set theme based on preference
-    if theme_preference == "dark":
-        theme = gr.themes.Monochrome()
-    else:
-        theme = gr.themes.Glass()
+    # Set theme based on environment variable
+    theme_map = {
+        "glass": gr.themes.Glass(),
+        "monochrome": gr.themes.Monochrome(),
+        "soft": gr.themes.Soft(),
+        "base": gr.themes.Base(),
+        "default": gr.themes.Default()
+    }
+    theme = theme_map.get(GRADIO_THEME.lower(), gr.themes.Glass())
 
     with gr.Blocks(title="Local GPT Chat", theme=theme) as demo:
-        # State for sidebar visibility and theme
+        # State for sidebar visibility
         sidebar_visible = gr.State(initial_sidebar_visible)
-        current_theme = gr.State(theme_preference)
 
         # Main layout container
         with gr.Row():
@@ -333,10 +364,9 @@ def create_interface():
 
             # Right main content area
             with gr.Column(scale=3) as main_content:
-                # Header with model selection, theme toggle, and sidebar toggle button
+                # Header with model selection and sidebar toggle button
                 with gr.Row():
                     sidebar_toggle_btn = gr.Button("« Hide Chat History" if initial_sidebar_visible else "» Show Chat History", variant="secondary", size="sm", scale=1)
-                    theme_toggle_btn = gr.Button("🌙" if theme_preference == "light" else "☀️", variant="secondary", size="sm", scale=1)
                     with gr.Column(scale=8):
                         gr.HTML("<h1 style='text-align: center;'>🤖 Local GPT Chat</h1>")
                     with gr.Column(scale=3):
@@ -369,6 +399,26 @@ def create_interface():
                     show_copy_button=True
                 )
 
+                # File upload area
+                with gr.Row():
+                    file_upload = gr.File(
+                        file_count="multiple",
+                        label="📎 Attach Files",
+                        file_types=[
+                            ".pdf", ".docx", ".pptx", ".xlsx", ".doc", ".ppt", ".xls",
+                            ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp",
+                            ".mp3", ".wav", ".m4a", ".ogg", ".flac",
+                            ".txt", ".md", ".html", ".htm", ".csv", ".json", ".xml", ".yaml", ".yml",
+                            ".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".css", ".sql"
+                        ],
+                        height=60,
+                        container=True,
+                        interactive=True
+                    )
+
+                # Uploaded files display
+                uploaded_files_display = gr.HTML(value="", visible=True)
+
                 # Input area at bottom
                 with gr.Row():
                     msg_input = gr.Textbox(
@@ -387,10 +437,58 @@ def create_interface():
         # State to track selected conversation ID
         selected_conversation_id = gr.State("")
 
+        # State to track uploaded files for processing
+        uploaded_files_state = gr.State([])
+
         # Hidden button for conversation loading
         load_conversation_btn = gr.Button("Load Conversation", visible=False)
 
         # Event handlers
+        def handle_file_upload(files):
+            """Handle file upload and display processing status"""
+            if not files:
+                return [], ""
+
+            global file_processor
+            if not file_processor:
+                return [], "⚠️ File processor not initialized"
+
+            # Process files
+            file_paths = [file.name for file in files if file and hasattr(file, 'name')]
+            if not file_paths:
+                return [], "❌ No valid files uploaded"
+
+            processed_files = file_processor.process_multiple_files(file_paths)
+            summary = file_processor.get_processing_summary(processed_files)
+
+            # Create display HTML
+            html_parts = ["<div style='margin: 10px 0; padding: 10px; background: rgba(0,0,0,0.1); border-radius: 8px;'>"]
+            html_parts.append(f"<h4>📁 Files Attached ({summary['successful']}/{summary['total_files']} processed)</h4>")
+
+            if summary['successful_files']:
+                html_parts.append("<div style='margin: 5px 0;'>")
+                for filename in summary['successful_files']:
+                    html_parts.append(f"<span style='margin-right: 10px; padding: 2px 6px; background: rgba(0,200,0,0.2); border-radius: 4px;'>✅ {filename}</span>")
+                html_parts.append("</div>")
+
+            if summary['failed_files']:
+                html_parts.append("<div style='margin: 5px 0;'>")
+                for filename, error in summary['failed_files']:
+                    html_parts.append(f"<span style='margin-right: 10px; padding: 2px 6px; background: rgba(200,0,0,0.2); border-radius: 4px;' title='{error}'>❌ {filename}</span>")
+                html_parts.append("</div>")
+
+            if summary['total_content_length'] > 0:
+                content_kb = summary['total_content_length'] / 1024
+                html_parts.append(f"<small>Total content: {content_kb:.1f}KB</small>")
+
+            html_parts.append("</div>")
+
+            return processed_files, "".join(html_parts)
+
+        def clear_uploaded_files():
+            """Clear uploaded files"""
+            return [], ""
+
         def update_model_info(model_choice):
             if not model_choice or model_choice == "No models available":
                 return "Select a model to see its description."
@@ -504,8 +602,8 @@ def create_interface():
 
         send_btn.click(
             chat_function,
-            inputs=[msg_input, chatbot, model_dropdown],
-            outputs=[msg_input, chatbot]
+            inputs=[msg_input, chatbot, model_dropdown, uploaded_files_state],
+            outputs=[msg_input, chatbot, uploaded_files_state, uploaded_files_display]
         ).then(
             lambda search_query: gr.update(choices=load_conversations_list(search_query)),
             inputs=[search_input],
@@ -514,8 +612,8 @@ def create_interface():
 
         msg_input.submit(
             chat_function,
-            inputs=[msg_input, chatbot, model_dropdown],
-            outputs=[msg_input, chatbot]
+            inputs=[msg_input, chatbot, model_dropdown, uploaded_files_state],
+            outputs=[msg_input, chatbot, uploaded_files_state, uploaded_files_display]
         ).then(
             lambda search_query: gr.update(choices=load_conversations_list(search_query)),
             inputs=[search_input],
@@ -530,6 +628,10 @@ def create_interface():
             lambda search_query: gr.update(choices=load_conversations_list(search_query), value=None),
             inputs=[search_input],
             outputs=[conversations_radio]
+        ).then(
+            clear_uploaded_files,
+            inputs=[],
+            outputs=[uploaded_files_state, uploaded_files_display]
         )
 
         new_chat_btn.click(
@@ -540,6 +642,10 @@ def create_interface():
             lambda search_query: gr.update(choices=load_conversations_list(search_query), value=None),
             inputs=[search_input],
             outputs=[conversations_radio]
+        ).then(
+            clear_uploaded_files,
+            inputs=[],
+            outputs=[uploaded_files_state, uploaded_files_display]
         )
 
         # Conversation selection handler
@@ -549,13 +655,13 @@ def create_interface():
                 global current_conversation_id
                 current_conversation_id = selected
                 messages = load_conversation_messages(selected)
-                return messages, ""  # Clear search when selecting conversation
-            return [], ""
+                return messages, "", [], ""  # Clear search and uploaded files when selecting conversation
+            return [], "", [], ""
 
         conversations_radio.change(
             handle_conversation_selection,
             inputs=[conversations_radio],
-            outputs=[chatbot, search_input]
+            outputs=[chatbot, search_input, uploaded_files_state, uploaded_files_display]
         ).then(
             lambda: gr.update(choices=load_conversations_list("")),
             outputs=[conversations_radio]
@@ -567,17 +673,6 @@ def create_interface():
             button_text = "« Hide Chat History" if new_visible else "» Show Chat History"
             return new_visible, button_text, gr.update(visible=new_visible)
 
-        def handle_theme_toggle(current_theme_val):
-            """Toggle between light and dark theme"""
-            new_theme = "dark" if current_theme_val == "light" else "light"
-            set_preference("theme_preference", new_theme)
-            new_button_text = "🌙" if new_theme == "light" else "☀️"
-
-            # Show meaningful notification about theme change
-            theme_name = "dark" if new_theme == "dark" else "light"
-            gr.Info(f"Switched to {theme_name} theme! Please refresh the page to see the change.")
-
-            return new_theme, new_button_text
 
         sidebar_toggle_btn.click(
             handle_sidebar_toggle,
@@ -585,11 +680,6 @@ def create_interface():
             outputs=[sidebar_visible, sidebar_toggle_btn, sidebar]
         )
 
-        theme_toggle_btn.click(
-            handle_theme_toggle,
-            inputs=[current_theme],
-            outputs=[current_theme, theme_toggle_btn]
-        )
 
         search_input.change(
             handle_search,
@@ -616,6 +706,13 @@ def create_interface():
             outputs=[chatbot]
         )
 
+        # File upload event handlers
+        file_upload.change(
+            handle_file_upload,
+            inputs=[file_upload],
+            outputs=[uploaded_files_state, uploaded_files_display]
+        )
+
         # Initialize conversations list on startup
         demo.load(
             lambda: gr.update(choices=load_conversations_list("")),
@@ -627,7 +724,7 @@ def create_interface():
 
 def initialize_app():
     """Initialize application globals - called both by main() and when imported for Gradio CLI"""
-    global db_service, user_preferences, available_models
+    global db_service, user_preferences, available_models, file_processor
 
     if not LLM_API_KEY:
         print("❌ Error: LLM_API_KEY not found in environment variables")
@@ -659,6 +756,15 @@ def initialize_app():
         print(f"Found {len(models)} available models")
     else:
         print("Warning: Could not fetch models. Check your API key.")
+
+    # Initialize file processor
+    try:
+        print("Initializing file processor...")
+        file_processor = FileProcessor(llm_api_key=LLM_API_KEY, llm_base_url=LLM_BASE_URL)
+        print("File processor initialized successfully")
+    except Exception as e:
+        print(f"Warning: Could not initialize file processor: {e}")
+        print("File upload functionality will be limited")
 
     return True
 

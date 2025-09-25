@@ -1,8 +1,8 @@
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from contextlib import contextmanager
-from models import Base, Conversation, Message
-from typing import List, Tuple, Optional
+from models import Base, Conversation, Message, FileAttachment
+from typing import List, Tuple, Optional, Dict
 import os
 
 class DatabaseService:
@@ -184,3 +184,77 @@ class DatabaseService:
             session.query(Conversation).filter(
                 Conversation.id == conversation_id
             ).delete()
+
+    def save_file_attachment(self, message_id: str, file_data: Dict) -> str:
+        """Save a file attachment to the database"""
+        with self.get_session() as session:
+            attachment = FileAttachment(
+                message_id=message_id,
+                filename=file_data['file_info']['filename'],
+                original_filename=file_data['file_info']['filename'],
+                file_size=file_data['file_info']['size'],
+                file_hash=file_data['file_info']['hash'],
+                mime_type=file_data['file_info']['mime_type'],
+                extension=file_data['file_info']['extension'],
+                markdown_content=file_data['markdown_content'],
+                content_length=file_data.get('content_length', 0),
+                processing_metadata={'success': file_data['success'], 'error': file_data.get('error')}
+            )
+            session.add(attachment)
+            session.flush()
+            return str(attachment.id)
+
+    def get_message_attachments(self, message_id: str) -> List[Dict]:
+        """Get all file attachments for a message"""
+        with self.get_session() as session:
+            attachments = session.query(FileAttachment).filter(
+                FileAttachment.message_id == message_id
+            ).all()
+
+            return [{
+                'id': str(att.id),
+                'filename': att.filename,
+                'original_filename': att.original_filename,
+                'file_size': att.file_size,
+                'file_hash': att.file_hash,
+                'mime_type': att.mime_type,
+                'extension': att.extension,
+                'markdown_content': att.markdown_content,
+                'content_length': att.content_length,
+                'processing_metadata': att.processing_metadata,
+                'created_at': att.created_at
+            } for att in attachments]
+
+    def check_file_exists(self, file_hash: str) -> Optional[Dict]:
+        """Check if a file with the given hash already exists"""
+        with self.get_session() as session:
+            attachment = session.query(FileAttachment).filter(
+                FileAttachment.file_hash == file_hash
+            ).first()
+
+            if attachment:
+                return {
+                    'id': str(attachment.id),
+                    'filename': attachment.filename,
+                    'file_size': attachment.file_size,
+                    'markdown_content': attachment.markdown_content,
+                    'created_at': attachment.created_at
+                }
+            return None
+
+    def get_conversation_attachments(self, conversation_id: str) -> List[Dict]:
+        """Get all file attachments for a conversation"""
+        with self.get_session() as session:
+            attachments = session.query(FileAttachment).join(Message).filter(
+                Message.conversation_id == conversation_id
+            ).all()
+
+            return [{
+                'id': str(att.id),
+                'filename': att.filename,
+                'file_size': att.file_size,
+                'mime_type': att.mime_type,
+                'extension': att.extension,
+                'created_at': att.created_at,
+                'message_id': str(att.message_id)
+            } for att in attachments]

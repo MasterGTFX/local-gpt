@@ -1,0 +1,13 @@
+Test File for MarkItDown Processing
+
+This is a simple text file to test the file processing functionality.
+
+Key Features:
+- File upload and processing
+- Markdown conversion
+- Context integration with LLM
+- Database storage of attachments
+
+The file should be converted to markdown and included as context when sent to the LLM.
+
+End of test file.

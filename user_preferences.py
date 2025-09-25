@@ -13,8 +13,7 @@ class UserPreferences:
         self._preferences = {}
         self._defaults = {
             "last_selected_model": None,
-            "sidebar_visible": True,
-            "theme_preference": "light"
+            "sidebar_visible": True
         }
         self.load_preferences()
 

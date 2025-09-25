@@ -625,19 +625,16 @@ def create_interface():
 
     return demo
 
-def main():
-    """Main function to run the application"""
-    global db_service
+def initialize_app():
+    """Initialize application globals - called both by main() and when imported for Gradio CLI"""
+    global db_service, user_preferences, available_models
 
     if not LLM_API_KEY:
         print("❌ Error: LLM_API_KEY not found in environment variables")
         print("Please copy .env.example to .env and add your LLM API key")
-        return
-
-    print("Starting Local GPT Chat...")
+        return False
 
     # Load user preferences
-    global user_preferences
     user_preferences = load_preferences()
     print(f"Loaded user preferences: {len(user_preferences)} settings")
 
@@ -663,6 +660,15 @@ def main():
     else:
         print("Warning: Could not fetch models. Check your API key.")
 
+    return True
+
+def main():
+    """Main function to run the application"""
+    print("Starting Local GPT Chat...")
+
+    if not initialize_app():
+        return
+
     # Create and launch the interface
     demo = create_interface()
 
@@ -673,6 +679,10 @@ def main():
         share=False,
         show_error=True
     )
+
+# Initialize app and create demo for Gradio CLI compatibility
+initialize_app()
+demo = create_interface()
 
 if __name__ == "__main__":
     main()

@@ -24,6 +24,7 @@ current_conversation_id: Optional[str] = None
 current_model_choice = ""
 user_preferences = {}
 file_processor: Optional[FileProcessor] = None
+current_conversation_tokens = 0
 
 def fetch_available_models() -> List[Dict]:
     """Fetch available models from LLM API"""
@@ -103,8 +104,8 @@ def messages_to_openai_format(messages: List[Dict[str, str]]) -> List[Dict[str, 
     """Convert Gradio messages format to OpenAI API format"""
     return [{"role": msg["role"], "content": msg["content"]} for msg in messages if msg.get("content")]
 
-def send_message_to_llm(messages: List[Dict[str, str]], model_id: str) -> str:
-    """Send message to LLM API and get response"""
+def send_message_to_llm(messages: List[Dict[str, str]], model_id: str) -> Tuple[str, Optional[Dict]]:
+    """Send message to LLM API and get response with token usage"""
     try:
         headers = {
             "Authorization": f"Bearer {LLM_API_KEY}",
@@ -125,12 +126,14 @@ def send_message_to_llm(messages: List[Dict[str, str]], model_id: str) -> str:
         result = response.json()
 
         if "choices" in result and len(result["choices"]) > 0:
-            return result["choices"][0]["message"]["content"]
+            content = result["choices"][0]["message"]["content"]
+            usage = result.get("usage")
+            return content, usage
         else:
-            return "Error: No response from model"
+            return "Error: No response from model", None
 
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"Error: {str(e)}", None
 
 def ensure_conversation() -> str:
     """Ensure we have a current conversation, create one if needed"""
@@ -230,8 +233,9 @@ def toggle_sidebar_visibility(visible: bool):
 
 def start_new_conversation() -> List[Dict[str, str]]:
     """Start a new conversation and return empty chat history"""
-    global current_conversation_id
+    global current_conversation_id, current_conversation_tokens
     current_conversation_id = None  # Will be created when first message is sent
+    current_conversation_tokens = 0
     return []
 
 def chat_function(message: str, history: List[Dict[str, str]], model_choice: str, uploaded_files: List[Dict] = None) -> Tuple[str, List[Dict[str, str]], List[Dict], gr.update]:
@@ -300,7 +304,12 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
     # Create a temporary history with the file context message for the LLM
     temp_history = history + [{"role": "user", "content": llm_message}]
     openai_messages = messages_to_openai_format(temp_history)
-    response = send_message_to_llm(openai_messages, model_id)
+    response, usage = send_message_to_llm(openai_messages, model_id)
+
+    # Update global token counter
+    global current_conversation_tokens
+    if usage and "total_tokens" in usage:
+        current_conversation_tokens += usage["total_tokens"]
 
     # Add assistant response to history
     assistant_message = {"role": "assistant", "content": response}
@@ -343,9 +352,6 @@ def create_interface():
         with gr.Row():
             # Left sidebar for conversations
             with gr.Column(scale=1, visible=initial_sidebar_visible, min_width=250) as sidebar:
-                # New Chat button
-                new_chat_btn = gr.Button("+ New Chat", variant="primary", size="lg")
-
                 # Search conversations
                 search_input = gr.Textbox(
                     placeholder="🔍 Search conversations...",
@@ -388,6 +394,13 @@ def create_interface():
                             container=False
                         )
 
+                # Token usage display
+                with gr.Row():
+                    token_usage_display = gr.HTML(
+                        value="<div style='text-align: center; padding: 5px;'><span style='color: #666;'>Tokens: 0 / Unknown</span></div>",
+                        visible=True
+                    )
+
                 # Main chat interface
                 chatbot = gr.Chatbot(
                     type="messages",
@@ -399,12 +412,23 @@ def create_interface():
                     show_copy_button=True
                 )
 
-                # File upload area with integrated display
+                # Input area - full width message bar
                 with gr.Row():
-                    with gr.Column():
+                    msg_input = gr.Textbox(
+                        placeholder="Message Local GPT...",
+                        show_label=False,
+                        scale=1,
+                        container=False,
+                        lines=2,
+                        max_lines=4
+                    )
+
+                # File upload area and buttons row
+                with gr.Row():
+                    with gr.Column(scale=8):
                         file_upload = gr.File(
                             file_count="multiple",
-                            label="📎 Attach Files (Max 50MB each) - Supported: PDF, Office docs, images, audio, text, code",
+                            label="📎 Attach Files (Max 50MB each)",
                             file_types=[
                                 ".pdf", ".docx", ".pptx", ".xlsx", ".doc", ".ppt", ".xls",
                                 ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp",
@@ -412,32 +436,25 @@ def create_interface():
                                 ".txt", ".md", ".html", ".htm", ".csv", ".json", ".xml", ".yaml", ".yml",
                                 ".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".css", ".sql"
                             ],
-                            height=120,
                             container=True,
                             interactive=True
                         )
+                    with gr.Column(scale=2):
+                        send_btn = gr.Button("Send", variant="primary", size="lg")
+                        clear_btn = gr.Button("Clear", variant="secondary", size="lg")
+                        new_chat_btn = gr.Button("+ New Chat", variant="stop", size="lg")
 
-                        # Integrated file status display
-                        uploaded_files_table = gr.Dataframe(
-                            headers=["📄 File", "📊 Size", "📈 Characters", "✅ Status"],
-                            datatype=["str", "str", "str", "str"],
-                            col_count=4,
-                            label="",
-                            visible=False,
-                            interactive=False,
-                            wrap=True
-                        )
-
-                # Input area at bottom
+                # File status display
                 with gr.Row():
-                    msg_input = gr.Textbox(
-                        placeholder="Message Local GPT...",
-                        show_label=False,
-                        scale=8,
-                        container=False
+                    uploaded_files_table = gr.Dataframe(
+                        headers=["📄 File", "📊 Size", "🔢 Tokens", "✅ Status"],
+                        datatype=["str", "str", "str", "str"],
+                        col_count=4,
+                        label="",
+                        visible=False,
+                        interactive=False,
+                        wrap=True
                     )
-                    send_btn = gr.Button("Send", scale=1, variant="primary")
-                    clear_btn = gr.Button("Clear", scale=1, variant="secondary")
 
                 # Model info in a collapsible section
                 with gr.Accordion("Model Information", open=False):
@@ -453,27 +470,27 @@ def create_interface():
         load_conversation_btn = gr.Button("Load Conversation", visible=False)
 
         # Event handlers
-        def handle_file_upload(files):
+        def handle_file_upload(files, model_choice):
             """Handle file upload and display in integrated table"""
             if not files:
-                return [], gr.update(visible=False, value=[])
+                return [], gr.update(visible=False, value=[]), update_token_display(model_choice)
 
             global file_processor
             if not file_processor:
                 error_data = [["⚠️ Error", "File processor not initialized", "0", "Failed"]]
-                return [], gr.update(visible=True, value=error_data)
+                return [], gr.update(visible=True, value=error_data), update_token_display(model_choice)
 
             # Process files
             file_paths = [file.name for file in files if file and hasattr(file, 'name')]
             if not file_paths:
                 error_data = [["⚠️ Error", "No valid files uploaded", "0", "Failed"]]
-                return [], gr.update(visible=True, value=error_data)
+                return [], gr.update(visible=True, value=error_data), update_token_display(model_choice)
 
             processed_files = file_processor.process_multiple_files(file_paths)
 
             # Create table data with detailed information
             table_data = []
-            total_chars = 0
+            total_tokens = 0
             total_size = 0
             successful_count = 0
 
@@ -484,18 +501,18 @@ def create_interface():
                     size_display = f"{size_bytes / 1024:.1f}KB" if size_bytes < 1024*1024 else f"{size_bytes / (1024*1024):.1f}MB"
 
                     if file_data['success']:
-                        chars = file_data.get('content_length', 0)
-                        char_display = f"{chars:,}" if chars > 0 else "0"
+                        tokens = file_data.get('token_count', 0)
+                        token_display = f"{tokens:,}" if tokens > 0 else "0"
                         status = "✅ Success"
-                        total_chars += chars
+                        total_tokens += tokens
                         total_size += size_bytes
                         successful_count += 1
                     else:
-                        char_display = "0"
+                        token_display = "0"
                         error = file_data['error'][:40] + "..." if len(file_data['error']) > 40 else file_data['error']
                         status = f"❌ {error}"
 
-                    table_data.append([filename, size_display, char_display, status])
+                    table_data.append([filename, size_display, token_display, status])
 
             # Add summary row if multiple files
             if len(table_data) > 1:
@@ -503,12 +520,15 @@ def create_interface():
                 summary_row = [
                     f"📋 TOTAL ({successful_count}/{len(processed_files)} files)",
                     total_size_display,
-                    f"{total_chars:,}",
+                    f"{total_tokens:,}",
                     "📊 Summary"
                 ]
                 table_data.append(summary_row)
 
-            return processed_files, gr.update(visible=True, value=table_data)
+            # Note: File tokens are not added to conversation count here
+            # They will be counted as part of API response when first message is sent
+
+            return processed_files, gr.update(visible=True, value=table_data), update_token_display(model_choice)
 
         def clear_uploaded_files():
             """Clear uploaded files"""
@@ -552,8 +572,9 @@ def create_interface():
 
         def clear_conversation():
             """Clear the conversation history and start a new conversation"""
-            global current_conversation_id
+            global current_conversation_id, current_conversation_tokens
             current_conversation_id = None  # This will trigger creation of new conversation on next message
+            current_conversation_tokens = 0
             return []
 
         def handle_edit(history: List[Dict[str, str]], edit_data: gr.EditData) -> List[Dict[str, str]]:
@@ -587,7 +608,7 @@ def create_interface():
                 if new_history and new_history[-1]["role"] == "user":
                     model_id = extract_model_id(current_model_choice)
                     openai_messages = messages_to_openai_format(new_history)
-                    response = send_message_to_llm(openai_messages, model_id)
+                    response, _ = send_message_to_llm(openai_messages, model_id)
 
                     # Add new assistant response
                     assistant_message = {"role": "assistant", "content": response}
@@ -596,13 +617,42 @@ def create_interface():
             return history
 
 
+        def get_model_context_length(model_choice: str) -> int:
+            """Get context length for the selected model"""
+            model_name = model_choice.split("\n")[0] if "\n" in model_choice else model_choice.split(" - ")[0]
+            for model in available_models:
+                if model.get("name", "") == model_name:
+                    return model.get("context_length", 0)
+            return 0
+
+        def update_token_display(model_choice: str) -> str:
+            """Update token usage display"""
+            global current_conversation_tokens
+            context_length = get_model_context_length(model_choice)
+
+            if context_length > 0:
+                percentage = min((current_conversation_tokens / context_length) * 100, 100)
+                color = "#ef4444" if percentage > 90 else "#f59e0b" if percentage > 75 else "#10b981"
+
+                return f"""<div style='text-align: center; padding: 5px;'>
+                    <div style='margin-bottom: 3px;'>
+                        <span style='color: {color}; font-weight: bold;'>Tokens: {current_conversation_tokens:,} / {context_length:,}</span>
+                        <span style='color: #666; margin-left: 10px;'>({percentage:.1f}%)</span>
+                    </div>
+                    <div style='width: 100%; background-color: #e5e7eb; border-radius: 3px; height: 6px;'>
+                        <div style='width: {percentage:.1f}%; background-color: {color}; height: 100%; border-radius: 3px; transition: width 0.3s ease;'></div>
+                    </div>
+                </div>"""
+            else:
+                return f"<div style='text-align: center; padding: 5px;'><span style='color: #666;'>Tokens: {current_conversation_tokens:,} / Unknown</span></div>"
+
         def update_current_model(model_choice):
             """Update the current model choice for retry functionality"""
             global current_model_choice
             current_model_choice = model_choice
             # Save model preference
             set_preference("last_selected_model", model_choice)
-            return update_model_info(model_choice)
+            return update_model_info(model_choice), update_token_display(model_choice)
 
         def load_conversation_by_id(conversation_id: str, search_query: str = "") -> Tuple[List[Dict[str, str]], List[Tuple[str, str]]]:
             """Load a specific conversation by ID"""
@@ -622,7 +672,7 @@ def create_interface():
         model_dropdown.change(
             update_current_model,
             inputs=[model_dropdown],
-            outputs=[model_info]
+            outputs=[model_info, token_usage_display]
         )
 
         send_btn.click(
@@ -633,6 +683,10 @@ def create_interface():
             lambda search_query: gr.update(choices=load_conversations_list(search_query)),
             inputs=[search_input],
             outputs=[conversations_radio]
+        ).then(
+            lambda model_choice: update_token_display(model_choice),
+            inputs=[model_dropdown],
+            outputs=[token_usage_display]
         )
 
         msg_input.submit(
@@ -643,6 +697,10 @@ def create_interface():
             lambda search_query: gr.update(choices=load_conversations_list(search_query)),
             inputs=[search_input],
             outputs=[conversations_radio]
+        ).then(
+            lambda model_choice: update_token_display(model_choice),
+            inputs=[model_dropdown],
+            outputs=[token_usage_display]
         )
 
         clear_btn.click(
@@ -677,8 +735,9 @@ def create_interface():
         def handle_conversation_selection(selected):
             """Handle conversation selection and clear search"""
             if selected:
-                global current_conversation_id
+                global current_conversation_id, current_conversation_tokens
                 current_conversation_id = selected
+                current_conversation_tokens = 0  # Reset token counter for selected conversation
                 messages = load_conversation_messages(selected)
                 return messages, "", [], gr.update(visible=False, value=[])  # Clear search and uploaded files when selecting conversation
             return [], "", [], gr.update(visible=False, value=[])
@@ -734,15 +793,32 @@ def create_interface():
         # File upload event handlers
         file_upload.change(
             handle_file_upload,
-            inputs=[file_upload],
-            outputs=[uploaded_files_state, uploaded_files_table]
+            inputs=[file_upload, model_dropdown],
+            outputs=[uploaded_files_state, uploaded_files_table, token_usage_display]
         )
 
-        # Initialize conversations list on startup
+        # Initialize conversations list and model info on startup
+        def initialize_interface():
+            """Initialize the interface with conversations and model info"""
+            # Load conversations
+            conversations_update = gr.update(choices=load_conversations_list(""))
+
+            # Update model info and token display for the default selected model
+            default_model = model_dropdown.value
+            if default_model and default_model != "No models available":
+                model_info_text = update_model_info(default_model)
+                token_display_text = update_token_display(default_model)
+                # Also set the current model choice for retry functionality
+                global current_model_choice
+                current_model_choice = default_model
+                return conversations_update, model_info_text, token_display_text
+            else:
+                return conversations_update, "Select a model to see its description.", "<div style='text-align: center; padding: 5px;'><span style='color: #666;'>Tokens: 0 / Unknown</span></div>"
+
         demo.load(
-            lambda: gr.update(choices=load_conversations_list("")),
+            initialize_interface,
             inputs=[],
-            outputs=[conversations_radio]
+            outputs=[conversations_radio, model_info, token_usage_display]
         )
 
     return demo

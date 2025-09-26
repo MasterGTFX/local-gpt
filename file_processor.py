@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 from markitdown import MarkItDown
 import requests
+import tiktoken
 
 
 class FileProcessor:
@@ -35,6 +36,9 @@ class FileProcessor:
         # Initialize MarkItDown
         self.md_processor = None
         self._init_markitdown()
+
+        # Initialize tiktoken encoder
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")
 
     def _init_markitdown(self):
         """Initialize MarkItDown with optional LLM client"""
@@ -139,9 +143,10 @@ class FileProcessor:
 
             # Extract content and metadata
             markdown_content = result.text_content
+            token_count = self.count_tokens(markdown_content)
 
             # Add metadata header to markdown
-            metadata_header = self._create_metadata_header(file_info, len(markdown_content))
+            metadata_header = self._create_metadata_header(file_info, len(markdown_content), token_count)
             full_markdown = f"{metadata_header}\n\n{markdown_content}"
 
             return {
@@ -149,7 +154,8 @@ class FileProcessor:
                 'error': None,
                 'file_info': file_info,
                 'markdown_content': full_markdown,
-                'content_length': len(markdown_content)
+                'content_length': len(markdown_content),
+                'token_count': token_count
             }
 
         except Exception as e:
@@ -160,7 +166,11 @@ class FileProcessor:
                 'markdown_content': None
             }
 
-    def _create_metadata_header(self, file_info: Dict, content_length: int) -> str:
+    def count_tokens(self, text: str) -> int:
+        """Count tokens in text using tiktoken"""
+        return len(self.tokenizer.encode(text))
+
+    def _create_metadata_header(self, file_info: Dict, content_length: int, token_count: int) -> str:
         """Create a metadata header for the markdown content"""
         size_mb = file_info['size'] / (1024 * 1024)
 
@@ -170,6 +180,7 @@ Size: {size_mb:.2f} MB ({file_info['size']:,} bytes)
 Type: {file_info['mime_type'] or 'Unknown'}
 Extension: {file_info['extension']}
 Content Length: {content_length:,} characters
+Token Count: {token_count:,} tokens
 Hash: {file_info['hash'][:16]}...
 ---"""
 

@@ -234,20 +234,20 @@ def start_new_conversation() -> List[Dict[str, str]]:
     current_conversation_id = None  # Will be created when first message is sent
     return []
 
-def chat_function(message: str, history: List[Dict[str, str]], model_choice: str, uploaded_files: List[Dict] = None) -> Tuple[str, List[Dict[str, str]], List[Dict], str]:
+def chat_function(message: str, history: List[Dict[str, str]], model_choice: str, uploaded_files: List[Dict] = None) -> Tuple[str, List[Dict[str, str]], List[Dict], gr.update]:
     """Handle chat messages with optional file attachments"""
     global db_service, current_conversation_id, file_processor
 
     if not LLM_API_KEY:
         error_msg = {"role": "assistant", "content": "Error: Please set your LLM_API_KEY in the .env file"}
-        return "", history + [error_msg], [], ""
+        return "", history + [error_msg], [], gr.update(visible=False, value=[])
 
     if not message.strip():
-        return "", history, uploaded_files or [], ""
+        return "", history, uploaded_files or [], gr.update()
 
     if model_choice == "No models available":
         error_msg = {"role": "assistant", "content": "Error: No models available. Please check your API key."}
-        return "", history + [error_msg], [], ""
+        return "", history + [error_msg], [], gr.update(visible=False, value=[])
 
     model_id = extract_model_id(model_choice)
 
@@ -314,7 +314,7 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
             print(f"Error saving assistant message: {e}")
 
     # Clear uploaded files after successful processing and return empty state
-    return "", final_history, [], ""
+    return "", final_history, [], gr.update(visible=False, value=[])
 
 def create_interface():
     """Create the Gradio interface"""
@@ -399,25 +399,34 @@ def create_interface():
                     show_copy_button=True
                 )
 
-                # File upload area
+                # File upload area with integrated display
                 with gr.Row():
-                    file_upload = gr.File(
-                        file_count="multiple",
-                        label="📎 Attach Files",
-                        file_types=[
-                            ".pdf", ".docx", ".pptx", ".xlsx", ".doc", ".ppt", ".xls",
-                            ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp",
-                            ".mp3", ".wav", ".m4a", ".ogg", ".flac",
-                            ".txt", ".md", ".html", ".htm", ".csv", ".json", ".xml", ".yaml", ".yml",
-                            ".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".css", ".sql"
-                        ],
-                        height=60,
-                        container=True,
-                        interactive=True
-                    )
+                    with gr.Column():
+                        file_upload = gr.File(
+                            file_count="multiple",
+                            label="📎 Attach Files (Max 50MB each) - Supported: PDF, Office docs, images, audio, text, code",
+                            file_types=[
+                                ".pdf", ".docx", ".pptx", ".xlsx", ".doc", ".ppt", ".xls",
+                                ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp",
+                                ".mp3", ".wav", ".m4a", ".ogg", ".flac",
+                                ".txt", ".md", ".html", ".htm", ".csv", ".json", ".xml", ".yaml", ".yml",
+                                ".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".css", ".sql"
+                            ],
+                            height=120,
+                            container=True,
+                            interactive=True
+                        )
 
-                # Uploaded files display
-                uploaded_files_display = gr.HTML(value="", visible=True)
+                        # Integrated file status display
+                        uploaded_files_table = gr.Dataframe(
+                            headers=["📄 File", "📊 Size", "📈 Characters", "✅ Status"],
+                            datatype=["str", "str", "str", "str"],
+                            col_count=4,
+                            label="",
+                            visible=False,
+                            interactive=False,
+                            wrap=True
+                        )
 
                 # Input area at bottom
                 with gr.Row():
@@ -445,49 +454,65 @@ def create_interface():
 
         # Event handlers
         def handle_file_upload(files):
-            """Handle file upload and display processing status"""
+            """Handle file upload and display in integrated table"""
             if not files:
-                return [], ""
+                return [], gr.update(visible=False, value=[])
 
             global file_processor
             if not file_processor:
-                return [], "⚠️ File processor not initialized"
+                error_data = [["⚠️ Error", "File processor not initialized", "0", "Failed"]]
+                return [], gr.update(visible=True, value=error_data)
 
             # Process files
             file_paths = [file.name for file in files if file and hasattr(file, 'name')]
             if not file_paths:
-                return [], "❌ No valid files uploaded"
+                error_data = [["⚠️ Error", "No valid files uploaded", "0", "Failed"]]
+                return [], gr.update(visible=True, value=error_data)
 
             processed_files = file_processor.process_multiple_files(file_paths)
-            summary = file_processor.get_processing_summary(processed_files)
 
-            # Create display HTML
-            html_parts = ["<div style='margin: 10px 0; padding: 10px; background: rgba(0,0,0,0.1); border-radius: 8px;'>"]
-            html_parts.append(f"<h4>📁 Files Attached ({summary['successful']}/{summary['total_files']} processed)</h4>")
+            # Create table data with detailed information
+            table_data = []
+            total_chars = 0
+            total_size = 0
+            successful_count = 0
 
-            if summary['successful_files']:
-                html_parts.append("<div style='margin: 5px 0;'>")
-                for filename in summary['successful_files']:
-                    html_parts.append(f"<span style='margin-right: 10px; padding: 2px 6px; background: rgba(0,200,0,0.2); border-radius: 4px;'>✅ {filename}</span>")
-                html_parts.append("</div>")
+            for file_data in processed_files:
+                if file_data['file_info']:
+                    filename = file_data['file_info']['filename']
+                    size_bytes = file_data['file_info']['size']
+                    size_display = f"{size_bytes / 1024:.1f}KB" if size_bytes < 1024*1024 else f"{size_bytes / (1024*1024):.1f}MB"
 
-            if summary['failed_files']:
-                html_parts.append("<div style='margin: 5px 0;'>")
-                for filename, error in summary['failed_files']:
-                    html_parts.append(f"<span style='margin-right: 10px; padding: 2px 6px; background: rgba(200,0,0,0.2); border-radius: 4px;' title='{error}'>❌ {filename}</span>")
-                html_parts.append("</div>")
+                    if file_data['success']:
+                        chars = file_data.get('content_length', 0)
+                        char_display = f"{chars:,}" if chars > 0 else "0"
+                        status = "✅ Success"
+                        total_chars += chars
+                        total_size += size_bytes
+                        successful_count += 1
+                    else:
+                        char_display = "0"
+                        error = file_data['error'][:40] + "..." if len(file_data['error']) > 40 else file_data['error']
+                        status = f"❌ {error}"
 
-            if summary['total_content_length'] > 0:
-                content_kb = summary['total_content_length'] / 1024
-                html_parts.append(f"<small>Total content: {content_kb:.1f}KB</small>")
+                    table_data.append([filename, size_display, char_display, status])
 
-            html_parts.append("</div>")
+            # Add summary row if multiple files
+            if len(table_data) > 1:
+                total_size_display = f"{total_size / 1024:.1f}KB" if total_size < 1024*1024 else f"{total_size / (1024*1024):.1f}MB"
+                summary_row = [
+                    f"📋 TOTAL ({successful_count}/{len(processed_files)} files)",
+                    total_size_display,
+                    f"{total_chars:,}",
+                    "📊 Summary"
+                ]
+                table_data.append(summary_row)
 
-            return processed_files, "".join(html_parts)
+            return processed_files, gr.update(visible=True, value=table_data)
 
         def clear_uploaded_files():
             """Clear uploaded files"""
-            return [], ""
+            return [], gr.update(visible=False, value=[])
 
         def update_model_info(model_choice):
             if not model_choice or model_choice == "No models available":
@@ -603,7 +628,7 @@ def create_interface():
         send_btn.click(
             chat_function,
             inputs=[msg_input, chatbot, model_dropdown, uploaded_files_state],
-            outputs=[msg_input, chatbot, uploaded_files_state, uploaded_files_display]
+            outputs=[msg_input, chatbot, uploaded_files_state, uploaded_files_table]
         ).then(
             lambda search_query: gr.update(choices=load_conversations_list(search_query)),
             inputs=[search_input],
@@ -613,7 +638,7 @@ def create_interface():
         msg_input.submit(
             chat_function,
             inputs=[msg_input, chatbot, model_dropdown, uploaded_files_state],
-            outputs=[msg_input, chatbot, uploaded_files_state, uploaded_files_display]
+            outputs=[msg_input, chatbot, uploaded_files_state, uploaded_files_table]
         ).then(
             lambda search_query: gr.update(choices=load_conversations_list(search_query)),
             inputs=[search_input],
@@ -631,7 +656,7 @@ def create_interface():
         ).then(
             clear_uploaded_files,
             inputs=[],
-            outputs=[uploaded_files_state, uploaded_files_display]
+            outputs=[uploaded_files_state, uploaded_files_table]
         )
 
         new_chat_btn.click(
@@ -645,7 +670,7 @@ def create_interface():
         ).then(
             clear_uploaded_files,
             inputs=[],
-            outputs=[uploaded_files_state, uploaded_files_display]
+            outputs=[uploaded_files_state, uploaded_files_table]
         )
 
         # Conversation selection handler
@@ -655,13 +680,13 @@ def create_interface():
                 global current_conversation_id
                 current_conversation_id = selected
                 messages = load_conversation_messages(selected)
-                return messages, "", [], ""  # Clear search and uploaded files when selecting conversation
-            return [], "", [], ""
+                return messages, "", [], gr.update(visible=False, value=[])  # Clear search and uploaded files when selecting conversation
+            return [], "", [], gr.update(visible=False, value=[])
 
         conversations_radio.change(
             handle_conversation_selection,
             inputs=[conversations_radio],
-            outputs=[chatbot, search_input, uploaded_files_state, uploaded_files_display]
+            outputs=[chatbot, search_input, uploaded_files_state, uploaded_files_table]
         ).then(
             lambda: gr.update(choices=load_conversations_list("")),
             outputs=[conversations_radio]
@@ -710,7 +735,7 @@ def create_interface():
         file_upload.change(
             handle_file_upload,
             inputs=[file_upload],
-            outputs=[uploaded_files_state, uploaded_files_display]
+            outputs=[uploaded_files_state, uploaded_files_table]
         )
 
         # Initialize conversations list on startup

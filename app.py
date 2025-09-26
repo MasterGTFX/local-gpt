@@ -4,8 +4,11 @@ import gradio as gr
 from dotenv import load_dotenv
 from typing import List, Dict, Tuple, Optional
 from database import DatabaseService
-from user_preferences import get_preference, set_preference, load_preferences
+from user_preferences import get_preference, set_preference, load_preferences, create_user_preferences, set_active_preferences
 from file_processor import FileProcessor
+from user_service import UserService
+from auth import auth_service
+from migrations import MigrationService
 
 # Load environment variables
 load_dotenv()
@@ -16,15 +19,21 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 PORT = int(os.getenv("PORT", 7860))
 GRADIO_THEME = os.getenv("GRADIO_THEME", "glass")
 
+# Authentication configuration
+AUTH_ENABLED = os.getenv("AUTH_ENABLED", "false").lower() == "true"
+SESSION_TIMEOUT_HOURS = int(os.getenv("SESSION_TIMEOUT_HOURS", 24))
+
 # Global variables
 available_models = []
 selected_model = None
 db_service: Optional[DatabaseService] = None
+user_service: Optional[UserService] = None
 current_conversation_id: Optional[str] = None
 current_model_choice = ""
 user_preferences = {}
 file_processor: Optional[FileProcessor] = None
 current_conversation_tokens = 0
+current_user = None
 
 def fetch_available_models() -> List[Dict]:
     """Fetch available models from LLM API"""
@@ -137,10 +146,11 @@ def send_message_to_llm(messages: List[Dict[str, str]], model_id: str) -> Tuple[
 
 def ensure_conversation() -> str:
     """Ensure we have a current conversation, create one if needed"""
-    global current_conversation_id, db_service
+    global current_conversation_id, db_service, current_user
 
     if not current_conversation_id and db_service:
-        current_conversation_id = db_service.create_conversation()
+        user_id = str(current_user.id) if current_user else None
+        current_conversation_id = db_service.create_conversation(user_id=user_id)
 
     return current_conversation_id
 
@@ -154,16 +164,18 @@ def generate_conversation_title(content: str) -> str:
 
 def load_conversations_list(search_query: str = "") -> List[Tuple[str, str]]:
     """Load conversations for Radio component"""
-    global db_service
+    global db_service, current_user
 
     if not db_service:
         return []
 
     try:
+        user_id = str(current_user.id) if current_user else None
+
         if search_query and search_query.strip():
-            conversations = db_service.search_conversations(search_query, limit=20)
+            conversations = db_service.search_conversations(search_query, limit=20, user_id=user_id)
         else:
-            conversations = db_service.get_recent_conversations(limit=20)
+            conversations = db_service.get_recent_conversations(limit=20, user_id=user_id)
 
         if not conversations:
             return []
@@ -204,14 +216,17 @@ def load_conversations_list(search_query: str = "") -> List[Tuple[str, str]]:
 
 def load_conversation_messages(conversation_id: str) -> List[Dict[str, str]]:
     """Load conversation messages in Gradio format"""
-    global db_service
+    global db_service, current_user
 
     if not db_service or not conversation_id:
         return []
 
     try:
-        # Get messages using the existing database method
-        messages = db_service.get_conversation_messages(conversation_id)
+        # Get user ID for security verification
+        user_id = str(current_user.id) if current_user else None
+
+        # Get messages using the existing database method with user verification
+        messages = db_service.get_conversation_messages(conversation_id, user_id=user_id)
 
         # Convert from old format [(user_msg, assistant_msg)] to new messages format
         gradio_messages = []
@@ -325,6 +340,151 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
     # Clear uploaded files after successful processing and return empty state
     return "", final_history, [], gr.update(visible=False, value=[])
 
+def authenticate_user(username: str, password: str, remember_me: bool = False) -> Tuple[bool, str, str]:
+    """Authenticate user and create session"""
+    global user_service, current_user
+
+    if not user_service:
+        return False, "", "Authentication service not available"
+
+    if not username or not password:
+        return False, "", "Username and password are required"
+
+    try:
+        user = user_service.authenticate_user(username, password)
+        if user:
+            # Create session token
+            session_token = auth_service.create_session_token(user, remember_me)
+
+            # Set current user
+            current_user = user
+
+            # Switch to user's preferences
+            user_prefs = create_user_preferences(user_service, str(user.id))
+            set_active_preferences(user_prefs)
+
+            return True, session_token, f"Welcome, {user.display_name}!"
+        else:
+            return False, "", "Invalid username or password"
+
+    except Exception as e:
+        print(f"Authentication error: {e}")
+        return False, "", "Authentication failed"
+
+def logout_user(session_token: str) -> bool:
+    """Logout user and invalidate session"""
+    global current_user
+
+    if session_token:
+        auth_service.invalidate_session(session_token)
+
+    current_user = None
+
+    # Reset to default preferences
+    from user_preferences import preferences
+    set_active_preferences(preferences)
+
+    return True
+
+def verify_session(session_token: str) -> bool:
+    """Verify if session is still valid"""
+    global current_user, user_service
+
+    if not session_token:
+        return False
+
+    session = auth_service.get_session(session_token)
+    if not session:
+        current_user = None
+        return False
+
+    # Ensure current_user is set
+    if not current_user and user_service:
+        current_user = user_service.get_user_by_id(session['user_id'])
+
+    return current_user is not None
+
+def create_login_interface():
+    """Create the login interface"""
+    theme_map = {
+        "glass": gr.themes.Glass(),
+        "monochrome": gr.themes.Monochrome(),
+        "soft": gr.themes.Soft(),
+        "base": gr.themes.Base(),
+        "default": gr.themes.Default()
+    }
+    theme = theme_map.get(GRADIO_THEME.lower(), gr.themes.Glass())
+
+    with gr.Blocks(title="Local GPT - Login", theme=theme) as login_demo:
+        with gr.Column(elem_id="login-container"):
+            gr.HTML("<h1 style='text-align: center; margin-bottom: 2rem;'>🤖 Local GPT</h1>")
+            gr.HTML("<h2 style='text-align: center; margin-bottom: 2rem;'>Please sign in to continue</h2>")
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    pass  # Empty column for centering
+                with gr.Column(scale=2):
+                    username_input = gr.Textbox(
+                        label="Username",
+                        placeholder="Enter your username",
+                        container=True
+                    )
+                    password_input = gr.Textbox(
+                        label="Password",
+                        placeholder="Enter your password",
+                        type="password",
+                        container=True
+                    )
+                    remember_me_checkbox = gr.Checkbox(
+                        label="Remember me for 30 days",
+                        value=False
+                    )
+
+                    login_button = gr.Button("Sign In", variant="primary", size="lg")
+                    login_message = gr.HTML("")
+
+                with gr.Column(scale=1):
+                    pass  # Empty column for centering
+
+            # Hidden components for session management
+            session_token = gr.State("")
+            login_success = gr.State(False)
+
+        def handle_login(username, password, remember_me):
+            success, token, message = authenticate_user(username, password, remember_me)
+
+            if success:
+                return (
+                    True,  # login_success
+                    token,  # session_token
+                    f"<div style='color: green; text-align: center; margin-top: 1rem;'>{message}</div>",  # login_message
+                    "",  # username_input
+                    ""   # password_input
+                )
+            else:
+                return (
+                    False,  # login_success
+                    "",     # session_token
+                    f"<div style='color: red; text-align: center; margin-top: 1rem;'>{message}</div>",  # login_message
+                    username,  # keep username
+                    ""      # clear password
+                )
+
+        login_button.click(
+            handle_login,
+            inputs=[username_input, password_input, remember_me_checkbox],
+            outputs=[login_success, session_token, login_message, username_input, password_input]
+        )
+
+        # Allow Enter key to submit
+        password_input.submit(
+            handle_login,
+            inputs=[username_input, password_input, remember_me_checkbox],
+            outputs=[login_success, session_token, login_message, username_input, password_input]
+        )
+
+    return login_demo, login_success, session_token
+
 def create_interface():
     """Create the Gradio interface"""
     global user_preferences
@@ -370,11 +530,19 @@ def create_interface():
 
             # Right main content area
             with gr.Column(scale=3) as main_content:
-                # Header with model selection and sidebar toggle button
+                # Header with model selection, user info, and sidebar toggle button
                 with gr.Row():
                     sidebar_toggle_btn = gr.Button("« Hide Chat History" if initial_sidebar_visible else "» Show Chat History", variant="secondary", size="sm", scale=1)
-                    with gr.Column(scale=8):
+                    with gr.Column(scale=6):
                         gr.HTML("<h1 style='text-align: center;'>🤖 Local GPT Chat</h1>")
+                    with gr.Column(scale=2):
+                        # User info and logout (only shown if authenticated)
+                        if AUTH_ENABLED and current_user:
+                            with gr.Row():
+                                user_display = gr.HTML(f"<div style='text-align: right; padding: 10px;'>👤 {current_user.display_name}</div>")
+                                if current_user.is_admin:
+                                    admin_panel_btn = gr.Button("Admin Panel", variant="secondary", size="sm")
+                                logout_btn = gr.Button("Logout", variant="secondary", size="sm")
                     with gr.Column(scale=3):
                         # Get saved model preference or default to first available
                         saved_model = user_preferences.get("last_selected_model")
@@ -459,6 +627,49 @@ def create_interface():
                 # Model info in a collapsible section
                 with gr.Accordion("Model Information", open=False):
                     model_info = gr.Markdown("Select a model to see its description.")
+
+                # Admin Panel - always create but only visible to admins
+                admin_panel_visible = AUTH_ENABLED and current_user and current_user.is_admin
+                with gr.Accordion("👑 Admin Panel", open=False, visible=admin_panel_visible) as admin_accordion:
+                        gr.HTML("<h3>User Management</h3>")
+
+                        # Create New User Section
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                gr.HTML("<h4>Create New User</h4>")
+                                new_username = gr.Textbox(label="Username", placeholder="Enter username")
+                                new_password = gr.Textbox(label="Password", placeholder="Enter password", type="password")
+                                new_display_name = gr.Textbox(label="Display Name", placeholder="Enter display name (optional)")
+                                new_is_admin = gr.Checkbox(label="Admin User", value=False)
+                                create_user_btn = gr.Button("Create User", variant="primary")
+                                create_user_message = gr.HTML("")
+
+                            with gr.Column(scale=1):
+                                gr.HTML("<h4>Existing Users</h4>")
+                                users_list = gr.Dataframe(
+                                    headers=["Username", "Display Name", "Admin", "Active", "Created"],
+                                    datatype=["str", "str", "str", "str", "str"],
+                                    label="",
+                                    interactive=False,
+                                    wrap=True
+                                )
+                                with gr.Row():
+                                    refresh_users_btn = gr.Button("Refresh Users", variant="secondary")
+
+                                # User Management Actions
+                                gr.HTML("<h5>User Actions</h5>")
+                                with gr.Row():
+                                    target_username = gr.Textbox(label="Username", placeholder="Enter username to manage", scale=2)
+                                    delete_user_btn = gr.Button("Delete User", variant="stop", scale=1)
+                                user_action_message = gr.HTML("")
+
+                        # System Settings Section
+                        gr.HTML("<h4>System Settings</h4>")
+                        with gr.Row():
+                            auth_status = gr.HTML(f"<p>Authentication: <strong>{'Enabled' if AUTH_ENABLED else 'Disabled'}</strong></p>")
+                            active_sessions = gr.HTML("")
+
+                        refresh_status_btn = gr.Button("Refresh Status", variant="secondary")
 
         # State to track selected conversation ID
         selected_conversation_id = gr.State("")
@@ -654,6 +865,105 @@ def create_interface():
             set_preference("last_selected_model", model_choice)
             return update_model_info(model_choice), update_token_display(model_choice)
 
+        # Admin Panel Functions
+        def create_new_user(username, password, display_name, is_admin):
+            """Create a new user (admin only)"""
+            global user_service, current_user
+
+            if not current_user or not current_user.is_admin:
+                return "", "❌ Admin access required"
+
+            if not username or not password:
+                return "", "❌ Username and password are required"
+
+            try:
+                user_service.create_user(
+                    username=username,
+                    password=password,
+                    display_name=display_name or username,
+                    is_admin=is_admin
+                )
+                return "", f"✅ User '{username}' created successfully"
+            except ValueError as e:
+                return "", f"❌ {str(e)}"
+            except Exception as e:
+                return "", f"❌ Error creating user: {str(e)}"
+
+        def delete_user_by_username(username):
+            """Delete a user by username (admin only)"""
+            global user_service, current_user
+
+            if not current_user or not current_user.is_admin:
+                return "", "❌ Admin access required"
+
+            if not username:
+                return "", "❌ Username is required"
+
+            if username == current_user.username:
+                return "", "❌ Cannot delete your own account"
+
+            try:
+                # Find user by username
+                target_user = user_service.get_user_by_username(username)
+                if not target_user:
+                    return "", f"❌ User '{username}' not found"
+
+                # Delete the user
+                success = user_service.delete_user(str(target_user.id))
+                if success:
+                    return "", f"✅ User '{username}' deleted successfully"
+                else:
+                    return "", f"❌ Failed to delete user '{username}'"
+            except Exception as e:
+                return "", f"❌ Error deleting user: {str(e)}"
+
+        def load_users_list():
+            """Load list of all users for admin panel"""
+            global user_service, current_user
+
+            if not current_user or not current_user.is_admin or not user_service:
+                return []
+
+            try:
+                users = user_service.get_all_users()
+                user_data = []
+                for user in users:
+                    user_data.append([
+                        user.username or "N/A",
+                        user.display_name or "N/A",
+                        "Yes" if user.is_admin else "No",
+                        "Yes" if user.is_active else "No",
+                        user.created_at.strftime("%Y-%m-%d %H:%M") if user.created_at else "N/A"
+                    ])
+                return user_data
+            except Exception as e:
+                print(f"Error loading users: {e}")
+                return []
+
+        def refresh_admin_status():
+            """Refresh admin panel status information"""
+            global current_user
+
+            if not current_user or not current_user.is_admin:
+                return "❌ Admin access required", "❌ Admin access required"
+
+            try:
+                # Get session count
+                session_count = auth_service.get_active_sessions_count()
+                sessions_text = f"<p>Active Sessions: <strong>{session_count}</strong></p>"
+
+                # Get auth status
+                auth_text = f"<p>Authentication: <strong>{'Enabled' if AUTH_ENABLED else 'Disabled'}</strong></p>"
+
+                return auth_text, sessions_text
+            except Exception as e:
+                error_msg = f"❌ Error: {str(e)}"
+                return error_msg, error_msg
+
+        def clear_user_form():
+            """Clear the user creation form"""
+            return "", "", "", False, ""
+
         def load_conversation_by_id(conversation_id: str, search_query: str = "") -> Tuple[List[Dict[str, str]], List[Tuple[str, str]]]:
             """Load a specific conversation by ID"""
             global current_conversation_id
@@ -797,6 +1107,59 @@ def create_interface():
             outputs=[uploaded_files_state, uploaded_files_table, token_usage_display]
         )
 
+        # Admin Panel Event Handlers - always set up but conditionally functional
+        # Create user button
+        create_user_btn.click(
+            create_new_user,
+            inputs=[new_username, new_password, new_display_name, new_is_admin],
+            outputs=[new_username, create_user_message]
+        ).then(
+            lambda: ("", "", False),  # Clear password and checkbox
+            outputs=[new_password, new_display_name, new_is_admin]
+        ).then(
+            load_users_list,
+            outputs=[users_list]
+        )
+
+        # Refresh users button
+        refresh_users_btn.click(
+            load_users_list,
+            outputs=[users_list]
+        )
+
+        # Refresh status button
+        refresh_status_btn.click(
+            refresh_admin_status,
+            outputs=[auth_status, active_sessions]
+        )
+
+        # Delete user button
+        delete_user_btn.click(
+            delete_user_by_username,
+            inputs=[target_username],
+            outputs=[target_username, user_action_message]
+        ).then(
+            load_users_list,
+            outputs=[users_list]
+        )
+
+        # Logout button handler (only set up if auth is enabled and user is logged in)
+        if AUTH_ENABLED and current_user:
+            def handle_logout():
+                logout_user("")  # Clear session
+                return gr.HTML("<div style='color: green; text-align: center;'>Logged out successfully. Refresh the page to login again.</div>")
+
+            logout_btn.click(
+                handle_logout,
+                outputs=[user_display]
+            )
+
+        # Initialize admin panel data on load
+        def initialize_admin_panel():
+            users_data = load_users_list()
+            auth_text, sessions_text = refresh_admin_status()
+            return users_data, auth_text, sessions_text
+
         # Initialize conversations list and model info on startup
         def initialize_interface():
             """Initialize the interface with conversations and model info"""
@@ -811,43 +1174,93 @@ def create_interface():
                 # Also set the current model choice for retry functionality
                 global current_model_choice
                 current_model_choice = default_model
-                return conversations_update, model_info_text, token_display_text
-            else:
-                return conversations_update, "Select a model to see its description.", "<div style='text-align: center; padding: 5px;'><span style='color: #666;'>Tokens: 0 / Unknown</span></div>"
 
+                # Initialize admin panel if available
+                if AUTH_ENABLED and current_user and current_user.is_admin:
+                    users_data, auth_text, sessions_text = initialize_admin_panel()
+                else:
+                    users_data, auth_text, sessions_text = [], "", ""
+
+                return conversations_update, model_info_text, token_display_text, users_data, auth_text, sessions_text
+            else:
+                # Initialize admin panel if available
+                if AUTH_ENABLED and current_user and current_user.is_admin:
+                    users_data, auth_text, sessions_text = initialize_admin_panel()
+                else:
+                    users_data, auth_text, sessions_text = [], "", ""
+
+                return (
+                    conversations_update,
+                    "Select a model to see its description.",
+                    "<div style='text-align: center; padding: 5px;'><span style='color: #666;'>Tokens: 0 / Unknown</span></div>",
+                    users_data,
+                    auth_text,
+                    sessions_text
+                )
+
+        # Setup demo load - always include admin panel outputs for consistency
         demo.load(
             initialize_interface,
             inputs=[],
-            outputs=[conversations_radio, model_info, token_usage_display]
+            outputs=[conversations_radio, model_info, token_usage_display, users_list, auth_status, active_sessions]
         )
 
     return demo
 
 def initialize_app():
     """Initialize application globals - called both by main() and when imported for Gradio CLI"""
-    global db_service, user_preferences, available_models, file_processor
+    global db_service, user_service, user_preferences, available_models, file_processor, AUTH_ENABLED
 
     if not LLM_API_KEY:
         print("❌ Error: LLM_API_KEY not found in environment variables")
         print("Please copy .env.example to .env and add your LLM API key")
         return False
 
-    # Load user preferences
-    user_preferences = load_preferences()
-    print(f"Loaded user preferences: {len(user_preferences)} settings")
-
     # Initialize database if DATABASE_URL is provided
     if os.getenv("DATABASE_URL"):
         try:
             print("Initializing database...")
             db_service = DatabaseService()
+
+            # Run migrations if authentication is enabled
+            if AUTH_ENABLED:
+                print("Authentication enabled - checking for migrations...")
+                migration_service = MigrationService()
+                if migration_service.check_migration_needed():
+                    print("Running database migrations...")
+                    if not migration_service.run_migrations():
+                        print("❌ Database migration failed")
+                        return False
+                else:
+                    print("Database is up to date")
+
             db_service.init_db()
             print("Database initialized successfully")
+
+            # Initialize user service if authentication is enabled
+            if AUTH_ENABLED:
+                print("Initializing user service...")
+                user_service = UserService(db_service)
+
+                # Ensure default admin user exists
+                admin_user = user_service.ensure_default_admin()
+                print(f"Default admin user verified: {admin_user.username}")
+
         except Exception as e:
             print(f"Warning: Could not initialize database: {e}")
             print("Conversations will not be saved")
+            if AUTH_ENABLED:
+                print("❌ Authentication requires database - disabling authentication")
+                AUTH_ENABLED = False
     else:
         print("No DATABASE_URL found. Conversations will not be saved")
+        if AUTH_ENABLED:
+            print("❌ Authentication requires database - disabling authentication")
+            AUTH_ENABLED = False
+
+    # Load user preferences (file-based if no authentication)
+    user_preferences = load_preferences()
+    print(f"Loaded user preferences: {len(user_preferences)} settings")
 
     print(f"Fetching available models from LLM API...")
 
@@ -869,6 +1282,53 @@ def initialize_app():
 
     return True
 
+def create_app():
+    """Create the main application with authentication wrapper"""
+    if AUTH_ENABLED:
+        # Create login interface
+        login_demo, login_success, session_token = create_login_interface()
+
+        # Create main chat interface
+        chat_demo = create_interface()
+
+        # Create wrapper that shows login or chat based on authentication
+        with gr.Blocks(title="Local GPT Chat") as app:
+            with gr.Row():
+                with gr.Column(visible=True) as login_column:
+                    login_demo.render()
+
+                with gr.Column(visible=False) as chat_column:
+                    chat_demo.render()
+
+            # Session state
+            session_state = gr.State("")
+
+            # Handle successful login
+            def show_chat_interface(success, token):
+                if success and verify_session(token):
+                    return (
+                        gr.update(visible=False),  # login_column
+                        gr.update(visible=True),   # chat_column
+                        token                      # session_state
+                    )
+                return (
+                    gr.update(visible=True),   # login_column
+                    gr.update(visible=False),  # chat_column
+                    ""                         # session_state
+                )
+
+            # Monitor login success
+            login_success.change(
+                show_chat_interface,
+                inputs=[login_success, session_token],
+                outputs=[login_column, chat_column, session_state]
+            )
+
+        return app
+    else:
+        # No authentication - return main interface directly
+        return create_interface()
+
 def main():
     """Main function to run the application"""
     print("Starting Local GPT Chat...")
@@ -877,7 +1337,11 @@ def main():
         return
 
     # Create and launch the interface
-    demo = create_interface()
+    if AUTH_ENABLED:
+        print(f"Authentication enabled - admin login required")
+        print(f"Default admin credentials: admin / admin123")
+
+    demo = create_app()
 
     print(f"Starting server on http://localhost:{PORT}")
     demo.launch(
@@ -889,7 +1353,7 @@ def main():
 
 # Initialize app and create demo for Gradio CLI compatibility
 initialize_app()
-demo = create_interface()
+demo = create_app()
 
 if __name__ == "__main__":
     main()

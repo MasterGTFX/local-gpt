@@ -6,3 +6,4 @@ psycopg2-binary
 pgvector
 markitdown[all]
 tiktoken
+bcrypt

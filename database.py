@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from contextlib import contextmanager
-from models import Base, Conversation, Message, FileAttachment
+from models import Base, User, UserPreference, Conversation, Message, FileAttachment
 from typing import List, Tuple, Optional, Dict
 import os
 
@@ -39,10 +39,10 @@ class DatabaseService:
         finally:
             session.close()
 
-    def create_conversation(self, title: str = None) -> str:
+    def create_conversation(self, title: str = None, user_id: str = None) -> str:
         """Create a new conversation and return its ID"""
         with self.get_session() as session:
-            conversation = Conversation(title=title)
+            conversation = Conversation(title=title, user_id=user_id)
             session.add(conversation)
             session.flush()
             return str(conversation.id)
@@ -72,9 +72,18 @@ class DatabaseService:
 
             return str(message.id)
 
-    def get_conversation_messages(self, conversation_id: str) -> List[Tuple[str, str]]:
+    def get_conversation_messages(self, conversation_id: str, user_id: str = None) -> List[Tuple[str, str]]:
         """Get all messages for a conversation in Gradio format"""
         with self.get_session() as session:
+            # First verify the conversation belongs to the user (if user_id provided)
+            if user_id:
+                conversation = session.query(Conversation).filter(
+                    Conversation.id == conversation_id,
+                    Conversation.user_id == user_id
+                ).first()
+                if not conversation:
+                    return []  # Return empty if conversation doesn't belong to user
+
             messages = session.query(Message).filter(
                 Message.conversation_id == conversation_id
             ).order_by(Message.created_at).all()
@@ -92,10 +101,15 @@ class DatabaseService:
 
             return gradio_history
 
-    def get_recent_conversations(self, limit: int = 10) -> List[dict]:
+    def get_recent_conversations(self, limit: int = 10, user_id: str = None) -> List[dict]:
         """Get recent conversations with basic info"""
         with self.get_session() as session:
-            conversations = session.query(Conversation).order_by(
+            query = session.query(Conversation)
+
+            if user_id:
+                query = query.filter(Conversation.user_id == user_id)
+
+            conversations = query.order_by(
                 Conversation.updated_at.desc()
             ).limit(limit).all()
 
@@ -116,21 +130,30 @@ class DatabaseService:
 
             return result
 
-    def search_conversations(self, query: str, limit: int = 10) -> List[dict]:
+    def search_conversations(self, query: str, limit: int = 10, user_id: str = None) -> List[dict]:
         """Search conversations by title and message content"""
         if not query or not query.strip():
-            return self.get_recent_conversations(limit)
+            return self.get_recent_conversations(limit, user_id)
 
         query = query.strip().lower()
 
         with self.get_session() as session:
+            # Build base query with user filter
+            base_query = session.query(Conversation)
+            if user_id:
+                base_query = base_query.filter(Conversation.user_id == user_id)
+
             # Search in conversation titles
-            title_matches = session.query(Conversation).filter(
+            title_matches = base_query.filter(
                 Conversation.title.ilike(f'%{query}%')
             ).order_by(Conversation.updated_at.desc()).limit(limit).all()
 
             # Search in message content using JSONB operators
-            content_matches = session.query(Conversation).join(Message).filter(
+            content_query = base_query.join(Message)
+            if user_id:
+                content_query = content_query.filter(Conversation.user_id == user_id)
+
+            content_matches = content_query.filter(
                 Message.message_data['content'].astext.ilike(f'%{query}%')
             ).distinct().order_by(Conversation.updated_at.desc()).limit(limit).all()
 

@@ -75,6 +75,8 @@ class DatabaseService:
     def get_conversation_messages(self, conversation_id: str, user_id: str = None) -> List[Tuple[str, str]]:
         """Get all messages for a conversation in Gradio format"""
         with self.get_session() as session:
+            print(f"[DB] Loading messages for conversation {conversation_id}, user_id: {user_id}")
+
             # First verify the conversation belongs to the user (if user_id provided)
             if user_id:
                 conversation = session.query(Conversation).filter(
@@ -82,11 +84,17 @@ class DatabaseService:
                     Conversation.user_id == user_id
                 ).first()
                 if not conversation:
+                    print(f"[DB] Conversation {conversation_id} not found or doesn't belong to user {user_id}")
                     return []  # Return empty if conversation doesn't belong to user
+                print(f"[DB] Verified conversation {conversation_id} belongs to user {user_id}")
+            else:
+                print(f"[DB] Warning: Loading conversation {conversation_id} without user verification")
 
             messages = session.query(Message).filter(
                 Message.conversation_id == conversation_id
             ).order_by(Message.created_at).all()
+
+            print(f"[DB] Found {len(messages)} messages for conversation {conversation_id}")
 
             # Convert to Gradio format: [(user_msg, assistant_msg), ...]
             gradio_history = []
@@ -99,19 +107,27 @@ class DatabaseService:
                     gradio_history.append((user_msg, message.content_text))
                     user_msg = None
 
+            print(f"[DB] Converted to {len(gradio_history)} conversation pairs")
             return gradio_history
 
     def get_recent_conversations(self, limit: int = 10, user_id: str = None) -> List[dict]:
         """Get recent conversations with basic info"""
         with self.get_session() as session:
+            print(f"[DB] Loading recent conversations for user_id: {user_id}, limit: {limit}")
+
             query = session.query(Conversation)
 
             if user_id:
                 query = query.filter(Conversation.user_id == user_id)
+                print(f"[DB] Filtering conversations for user: {user_id}")
+            else:
+                print(f"[DB] Warning: Loading conversations without user filter")
 
             conversations = query.order_by(
                 Conversation.updated_at.desc()
             ).limit(limit).all()
+
+            print(f"[DB] Found {len(conversations)} conversations")
 
             result = []
             for conv in conversations:
@@ -128,25 +144,32 @@ class DatabaseService:
                     'updated_at': conv.updated_at
                 })
 
+            print(f"[DB] Returning {len(result)} conversation records")
             return result
 
     def search_conversations(self, query: str, limit: int = 10, user_id: str = None) -> List[dict]:
         """Search conversations by title and message content"""
         if not query or not query.strip():
+            print(f"[DB] Empty search query, returning recent conversations")
             return self.get_recent_conversations(limit, user_id)
 
         query = query.strip().lower()
+        print(f"[DB] Searching conversations for query: '{query}', user_id: {user_id}")
 
         with self.get_session() as session:
             # Build base query with user filter
             base_query = session.query(Conversation)
             if user_id:
                 base_query = base_query.filter(Conversation.user_id == user_id)
+                print(f"[DB] Filtering search results for user: {user_id}")
+            else:
+                print(f"[DB] Warning: Searching conversations without user filter")
 
             # Search in conversation titles
             title_matches = base_query.filter(
                 Conversation.title.ilike(f'%{query}%')
             ).order_by(Conversation.updated_at.desc()).limit(limit).all()
+            print(f"[DB] Found {len(title_matches)} title matches")
 
             # Search in message content using JSONB operators
             content_query = base_query.join(Message)
@@ -156,6 +179,7 @@ class DatabaseService:
             content_matches = content_query.filter(
                 Message.message_data['content'].astext.ilike(f'%{query}%')
             ).distinct().order_by(Conversation.updated_at.desc()).limit(limit).all()
+            print(f"[DB] Found {len(content_matches)} content matches")
 
             # Combine results and remove duplicates
             all_conversations = {}
@@ -168,6 +192,8 @@ class DatabaseService:
                 key=lambda x: x.updated_at,
                 reverse=True
             )[:limit]
+
+            print(f"[DB] Combined and sorted to {len(sorted_conversations)} unique results")
 
             result = []
             for conv in sorted_conversations:
@@ -184,6 +210,7 @@ class DatabaseService:
                     'updated_at': conv.updated_at
                 })
 
+            print(f"[DB] Returning {len(result)} search results")
             return result
 
     def set_conversation_title(self, conversation_id: str, title: str):

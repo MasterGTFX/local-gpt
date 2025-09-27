@@ -36,6 +36,7 @@ user_preferences = {}
 file_processor: Optional[FileProcessor] = None
 current_conversation_tokens = 0
 current_user = None
+last_conversations_user_id = None  # Track the user for whom conversations were last loaded
 
 def fetch_available_models() -> List[Dict]:
     """Fetch available models from LLM API"""
@@ -173,21 +174,35 @@ def generate_conversation_title(content: str) -> str:
 
 def load_conversations_list(search_query: str = "") -> List[Tuple[str, str]]:
     """Load conversations for Radio component"""
-    global db_service, current_user
+    global db_service, current_user, last_conversations_user_id
+
+    current_user_id = str(current_user.id) if current_user else None
+    print(f"[CONV] Loading conversations list, current_user: {current_user.username if current_user else 'None'}")
+    print(f"[CONV] Current user_id: {current_user_id}, last loaded for: {last_conversations_user_id}")
+
+    # Update the last user for whom conversations were loaded
+    last_conversations_user_id = current_user_id
 
     if not db_service:
+        print(f"[CONV] No database service available")
         return []
 
     try:
-        user_id = str(current_user.id) if current_user else None
+        user_id = current_user_id
+        print(f"[CONV] Using user_id: {user_id}")
 
         if search_query and search_query.strip():
+            print(f"[CONV] Searching conversations with query: '{search_query}'")
             conversations = db_service.search_conversations(search_query, limit=20, user_id=user_id)
         else:
+            print(f"[CONV] Loading recent conversations")
             conversations = db_service.get_recent_conversations(limit=20, user_id=user_id)
 
         if not conversations:
+            print(f"[CONV] No conversations found")
             return []
+
+        print(f"[CONV] Processing {len(conversations)} conversations for display")
 
         choices = []
         for conv in conversations:
@@ -217,25 +232,36 @@ def load_conversations_list(search_query: str = "") -> List[Tuple[str, str]]:
             display_name = f"{title}\n{time_str}" if time_str else title
             choices.append((display_name, conv_id))
 
+        print(f"[CONV] Returning {len(choices)} conversation choices")
         return choices
 
     except Exception as e:
-        print(f"Error loading conversations: {e}")
+        print(f"[CONV] Error loading conversations: {e}")
         return []
 
 def load_conversation_messages(conversation_id: str) -> List[Dict[str, str]]:
     """Load conversation messages in Gradio format"""
     global db_service, current_user
 
+    print(f"[CONV] Loading messages for conversation {conversation_id}, current_user: {current_user.username if current_user else 'None'}")
+
     if not db_service or not conversation_id:
+        print(f"[CONV] Missing database service or conversation_id")
         return []
 
     try:
         # Get user ID for security verification
         user_id = str(current_user.id) if current_user else None
+        print(f"[CONV] Loading messages with user_id: {user_id}")
 
         # Get messages using the existing database method with user verification
         messages = db_service.get_conversation_messages(conversation_id, user_id=user_id)
+
+        if not messages:
+            print(f"[CONV] No messages found for conversation {conversation_id}")
+            return []
+
+        print(f"[CONV] Converting {len(messages)} message pairs to Gradio format")
 
         # Convert from old format [(user_msg, assistant_msg)] to new messages format
         gradio_messages = []
@@ -243,10 +269,11 @@ def load_conversation_messages(conversation_id: str) -> List[Dict[str, str]]:
             gradio_messages.append({"role": "user", "content": user_msg})
             gradio_messages.append({"role": "assistant", "content": assistant_msg})
 
+        print(f"[CONV] Returning {len(gradio_messages)} messages")
         return gradio_messages
 
     except Exception as e:
-        print(f"Error loading conversation messages: {e}")
+        print(f"[CONV] Error loading conversation messages: {e}")
         return []
 
 def toggle_sidebar_visibility(visible: bool):
@@ -261,6 +288,11 @@ def start_new_conversation() -> List[Dict[str, str]]:
     current_conversation_id = None  # Will be created when first message is sent
     current_conversation_tokens = 0
     return []
+
+def refresh_conversations_for_user() -> List[Tuple[str, str]]:
+    """Refresh conversation list for the current user - used after authentication"""
+    print(f"[CONV] Refreshing conversations for current user: {current_user.username if current_user else 'None'}")
+    return load_conversations_list("")
 
 def chat_function(message: str, history: List[Dict[str, str]], model_choice: str, uploaded_files: List[Dict] = None) -> Tuple[str, List[Dict[str, str]], List[Dict], gr.update]:
     """Handle chat messages with optional file attachments"""
@@ -351,7 +383,7 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
 
 def authenticate_user(username: str, password: str, remember_me: bool = False) -> Tuple[bool, str, str]:
     """Authenticate user and create session"""
-    global user_service, current_user
+    global user_service, current_user, current_conversation_id, current_conversation_tokens
 
     if not user_service:
         return False, "", "Authentication service not available"
@@ -362,36 +394,53 @@ def authenticate_user(username: str, password: str, remember_me: bool = False) -
     try:
         user = user_service.authenticate_user(username, password)
         if user:
+            print(f"[AUTH] Authenticating user: {user.username} (ID: {user.id})")
+
+            # Clear previous user's conversation state
+            current_conversation_id = None
+            current_conversation_tokens = 0
+            print(f"[AUTH] Cleared conversation state for user switch")
+
             # Create session token
             session_token = auth_service.create_session_token(user, remember_me)
 
             # Set current user
             current_user = user
+            print(f"[AUTH] Set current_user to: {current_user.username}")
 
             # Switch to user's preferences
             user_prefs = create_user_preferences(user_service, str(user.id))
             set_active_preferences(user_prefs)
+            print(f"[AUTH] Loaded user preferences for user: {user.username}")
 
             return True, session_token, f"Welcome, {user.display_name}!"
         else:
+            print(f"[AUTH] Authentication failed for username: {username}")
             return False, "", "Invalid username or password"
 
     except Exception as e:
-        print(f"Authentication error: {e}")
+        print(f"[AUTH] Authentication error for {username}: {e}")
         return False, "", "Authentication failed"
 
 def logout_user(session_token: str) -> bool:
     """Logout user and invalidate session"""
-    global current_user
+    global current_user, current_conversation_id, current_conversation_tokens
+
+    print(f"[AUTH] Logging out user: {current_user.username if current_user else 'Unknown'}")
 
     if session_token:
         auth_service.invalidate_session(session_token)
 
+    # Clear user and conversation state
     current_user = None
+    current_conversation_id = None
+    current_conversation_tokens = 0
+    print(f"[AUTH] Cleared user and conversation state on logout")
 
     # Reset to default preferences
     from user_preferences import preferences
     set_active_preferences(preferences)
+    print(f"[AUTH] Reset to default preferences")
 
     return True
 
@@ -400,18 +449,31 @@ def verify_session(session_token: str) -> bool:
     global current_user, user_service
 
     if not session_token:
+        print(f"[AUTH] No session token provided for verification")
         return False
 
     session = auth_service.get_session(session_token)
     if not session:
+        print(f"[AUTH] Session not found or expired for token")
         current_user = None
         return False
 
     # Ensure current_user is set
     if not current_user and user_service:
         current_user = user_service.get_user_by_id(session['user_id'])
+        if current_user:
+            print(f"[AUTH] Restored current_user from session: {current_user.username}")
 
-    return current_user is not None
+            # Also ensure user preferences are loaded for the restored user
+            user_prefs = create_user_preferences(user_service, str(current_user.id))
+            set_active_preferences(user_prefs)
+            print(f"[AUTH] Restored user preferences for: {current_user.username}")
+        else:
+            print(f"[AUTH] Could not find user for session user_id: {session['user_id']}")
+
+    is_valid = current_user is not None
+    print(f"[AUTH] Session verification result: {is_valid}")
+    return is_valid
 
 def create_login_interface():
     """Create the login interface"""
@@ -699,7 +761,21 @@ def create_interface():
         # Hidden button for conversation loading
         load_conversation_btn = gr.Button("Load Conversation", visible=False)
 
+        # Hidden trigger for conversation list refresh (triggered by authentication events)
+        conversation_refresh_trigger = gr.Button("Refresh Conversations", visible=False)
+
         # Event handlers
+        def refresh_conversations_handler():
+            """Handle conversation list refresh after authentication"""
+            print(f"[CONV] Conversation refresh triggered")
+            return gr.update(choices=load_conversations_list(""), value=None)
+
+        # Wire up conversation refresh trigger
+        conversation_refresh_trigger.click(
+            refresh_conversations_handler,
+            inputs=[],
+            outputs=[conversations_radio]
+        )
         def handle_file_upload(files, model_choice):
             """Handle file upload and display in integrated table"""
             if not files:
@@ -802,6 +878,10 @@ def create_interface():
 
         def clear_conversation():
             """Clear the conversation history and start a new conversation"""
+            # Check if user context changed and refresh if needed
+            if check_conversations_need_refresh():
+                print(f"[CONV] User context changed during clear conversation")
+
             global current_conversation_id, current_conversation_tokens
             current_conversation_id = None  # This will trigger creation of new conversation on next message
             current_conversation_tokens = 0
@@ -996,6 +1076,9 @@ def create_interface():
 
         def handle_search(search_query: str):
             """Handle conversation search"""
+            # Check if user context changed and force refresh if needed
+            if check_conversations_need_refresh():
+                print(f"[CONV] User context changed during search, forcing refresh")
             return gr.update(choices=load_conversations_list(search_query))
 
         def handle_free_models_toggle(filter_free: bool):
@@ -1081,6 +1164,12 @@ def create_interface():
         # Conversation selection handler
         def handle_conversation_selection(selected):
             """Handle conversation selection and clear search"""
+            # Check if user context changed and refresh conversations if needed
+            if check_conversations_need_refresh():
+                print(f"[CONV] User context changed during conversation selection, refreshing")
+                # Don't select a conversation if user context changed - just refresh the list
+                return [], "", [], gr.update(visible=False, value=[])
+
             if selected:
                 global current_conversation_id, current_conversation_tokens
                 current_conversation_id = selected
@@ -1099,6 +1188,10 @@ def create_interface():
         )
 
         def handle_sidebar_toggle(visible):
+            # Check if user context changed and refresh if needed
+            if check_conversations_need_refresh():
+                print(f"[CONV] User context changed during sidebar toggle, refreshing")
+
             new_visible = not visible
             set_preference("sidebar_visible", new_visible)
             button_text = "« Hide Chat History" if new_visible else "» Show Chat History"
@@ -1187,11 +1280,32 @@ def create_interface():
             auth_text, sessions_text = refresh_admin_status()
             return users_data, auth_text, sessions_text
 
+        # Function to check if conversations need refresh due to user context change
+        def check_conversations_need_refresh():
+            """Check if conversation list needs refreshing due to user context change"""
+            global last_conversations_user_id
+            current_user_id = str(current_user.id) if current_user else None
+            needs_refresh = last_conversations_user_id != current_user_id
+            if needs_refresh:
+                print(f"[INIT] User context changed: {last_conversations_user_id} -> {current_user_id}, refreshing conversations")
+            return needs_refresh
+
         # Initialize conversations list and model info on startup
         def initialize_interface():
             """Initialize the interface with conversations and model info"""
-            # Load conversations
-            conversations_update = gr.update(choices=load_conversations_list(""))
+            print(f"[INIT] Initializing interface, current_user: {current_user.username if current_user else 'None'}")
+
+            # Defensive check: Don't load conversations before user authentication is established
+            if AUTH_ENABLED and current_user is None:
+                print(f"[INIT] Authentication enabled but no user context - deferring conversation loading")
+                conversations_update = gr.update(choices=[])
+            else:
+                # Check if we need to refresh conversations due to user context change
+                if check_conversations_need_refresh():
+                    print(f"[INIT] Forcing conversation refresh due to user context change")
+
+                # Load conversations (this will automatically use current_user context)
+                conversations_update = gr.update(choices=load_conversations_list(""))
 
             # Update model info and token display for the default selected model
             default_model = model_dropdown.value
@@ -1208,6 +1322,7 @@ def create_interface():
                 else:
                     users_data, auth_text, sessions_text = [], "", ""
 
+                print(f"[INIT] Interface initialized with model and admin panel")
                 return conversations_update, model_info_text, token_display_text, users_data, auth_text, sessions_text
             else:
                 # Initialize admin panel if available
@@ -1216,6 +1331,7 @@ def create_interface():
                 else:
                     users_data, auth_text, sessions_text = [], "", ""
 
+                print(f"[INIT] Interface initialized without model")
                 return (
                     conversations_update,
                     "Select a model to see its description.",
@@ -1234,9 +1350,9 @@ def create_interface():
 
     # Return demo and user interface elements for wrapper access
     if AUTH_ENABLED:
-        return demo, user_display, logout_btn
+        return demo, user_display, logout_btn, conversations_radio
     else:
-        return demo, None, None
+        return demo, None, None, None
 
 def initialize_app():
     """Initialize application globals - called both by main() and when imported for Gradio CLI"""
@@ -1350,7 +1466,7 @@ def create_app():
         login_demo, login_success, session_token = create_login_interface()
 
         # Create main chat interface
-        chat_demo, user_display, logout_btn = create_interface()
+        chat_demo, user_display, logout_btn, conversations_radio = create_interface()
 
         # Create wrapper that shows login or chat based on authentication
         with gr.Blocks(title="Local GPT Chat") as app:
@@ -1430,11 +1546,22 @@ def create_app():
                         gr.HTML("<div style='text-align: right; padding: 10px;'>👤 Guest</div>")  # user_display
                     )
 
+            # Conversation refresh handler for authentication events
+            def refresh_conversations_after_auth():
+                """Refresh conversation list after authentication events"""
+                print(f"[AUTH] Refreshing conversations after authentication event")
+                # Always try to refresh - if no user is authenticated, load_conversations_list will return empty list
+                return gr.update(choices=load_conversations_list(""))
+
             # Monitor login success and sync states
             login_success.change(
                 sync_session_states,
                 inputs=[login_success, session_token],
                 outputs=[login_column, chat_column, session_state, user_display]
+            ).then(
+                refresh_conversations_after_auth,
+                inputs=[],
+                outputs=[conversations_radio]
             )
 
             # Logout handler at wrapper level
@@ -1484,6 +1611,10 @@ def create_app():
                 initialize_auth_interface,
                 inputs=[session_state],
                 outputs=[login_column, chat_column, session_state, user_display]
+            ).then(
+                refresh_conversations_after_auth,
+                inputs=[],
+                outputs=[conversations_radio]
             )
 
             # Also listen for session state changes for manual restoration
@@ -1491,12 +1622,16 @@ def create_app():
                 restore_session,
                 inputs=[session_state],
                 outputs=[login_column, chat_column, session_state, user_display]
+            ).then(
+                refresh_conversations_after_auth,
+                inputs=[],
+                outputs=[conversations_radio]
             )
 
         return app
     else:
         # No authentication - return main interface directly
-        demo, _, _ = create_interface()
+        demo, _, _, _ = create_interface()
         return demo
 
 def main():

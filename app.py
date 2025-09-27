@@ -1,13 +1,15 @@
 import os
 import requests
 import gradio as gr
+import threading
+import time
 from dotenv import load_dotenv
 from typing import List, Dict, Tuple, Optional
 from database import DatabaseService
 from user_preferences import get_preference, set_preference, load_preferences, create_user_preferences, set_active_preferences
 from file_processor import FileProcessor
 from user_service import UserService
-from auth import auth_service
+from auth import auth_service, AuthService
 from migrations import MigrationService
 
 # Load environment variables
@@ -21,7 +23,7 @@ GRADIO_THEME = os.getenv("GRADIO_THEME", "glass")
 
 # Authentication configuration
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "false").lower() == "true"
-SESSION_TIMEOUT_HOURS = int(os.getenv("SESSION_TIMEOUT_HOURS", 24))
+SESSION_TIMEOUT_DAYS = int(os.getenv("SESSION_TIMEOUT_DAYS", 1))
 
 # Global variables
 available_models = []
@@ -57,7 +59,7 @@ def fetch_available_models() -> List[Dict]:
         print(f"Error fetching models: {e}")
         return []
 
-def get_model_choices() -> List[str]:
+def get_model_choices(filter_free: bool = False) -> List[str]:
     """Get list of model names for dropdown"""
     global available_models
     if not available_models:
@@ -72,6 +74,13 @@ def get_model_choices() -> List[str]:
         name = model.get("name", "Unknown")
         model_id = model.get("id", "")
         pricing = model.get("pricing", {})
+
+        # Check if this is a free model (contains "free" in name)
+        is_free_model = "free" in name.lower()
+
+        # Skip if we're filtering for free models and this isn't free
+        if filter_free and not is_free_model:
+            continue
 
         # Get pricing info per 1M tokens
         prompt_price = float(pricing.get("prompt", "0")) * 1_000_000
@@ -95,7 +104,7 @@ def get_model_choices() -> List[str]:
 
         choices.append(choice)
 
-    return choices
+    return choices if choices else ["No models available"]
 
 def extract_model_id(model_choice: str) -> str:
     """Extract model ID from dropdown choice"""
@@ -436,7 +445,7 @@ def create_login_interface():
                         container=True
                     )
                     remember_me_checkbox = gr.Checkbox(
-                        label="Remember me for 30 days",
+                        label="Remember me",
                         value=False
                     )
 
@@ -536,31 +545,41 @@ def create_interface():
                     with gr.Column(scale=6):
                         gr.HTML("<h1 style='text-align: center;'>🤖 Local GPT Chat</h1>")
                     with gr.Column(scale=2):
-                        # User info and logout (only shown if authenticated)
-                        if AUTH_ENABLED and current_user:
-                            with gr.Row():
-                                user_display = gr.HTML(f"<div style='text-align: right; padding: 10px;'>👤 {current_user.display_name}</div>")
-                                if current_user.is_admin:
-                                    admin_panel_btn = gr.Button("Admin Panel", variant="secondary", size="sm")
+                        # User info and logout (always visible if auth enabled)
+                        if AUTH_ENABLED:
+                            with gr.Row() as user_controls_row:
+                                user_display = gr.HTML("<div style='text-align: right; padding: 10px;'>👤 Guest</div>")
+                                admin_panel_btn = gr.Button("Admin Panel", variant="secondary", size="sm", visible=False)
                                 logout_btn = gr.Button("Logout", variant="secondary", size="sm")
                     with gr.Column(scale=3):
-                        # Get saved model preference or default to first available
-                        saved_model = user_preferences.get("last_selected_model")
-                        model_choices = get_model_choices()
-                        default_model = None
+                        # Model selection with free models toggle
+                        with gr.Row():
+                            with gr.Column(scale=6):
+                                # Get saved model preference or default to first available
+                                saved_model = user_preferences.get("last_selected_model")
+                                model_choices = get_model_choices()
+                                default_model = None
 
-                        if saved_model and saved_model in model_choices:
-                            default_model = saved_model
-                        elif model_choices != ["No models available"]:
-                            default_model = model_choices[0]
+                                if saved_model and saved_model in model_choices:
+                                    default_model = saved_model
+                                elif model_choices != ["No models available"]:
+                                    default_model = model_choices[0]
 
-                        model_dropdown = gr.Dropdown(
-                            choices=model_choices,
-                            value=default_model,
-                            label="Model",
-                            interactive=True,
-                            container=False
-                        )
+                                model_dropdown = gr.Dropdown(
+                                    choices=model_choices,
+                                    value=default_model,
+                                    label="Model",
+                                    interactive=True,
+                                    container=False
+                                )
+                            with gr.Column(scale=1, min_width=50):
+                                # Free models toggle - just an icon button
+                                free_models_toggle = gr.Checkbox(
+                                    label="🆓",
+                                    value=False,
+                                    container=False,
+                                    info="Show only free models"
+                                )
 
                 # Token usage display
                 with gr.Row():
@@ -979,10 +998,28 @@ def create_interface():
             """Handle conversation search"""
             return gr.update(choices=load_conversations_list(search_query))
 
+        def handle_free_models_toggle(filter_free: bool):
+            """Handle toggle for filtering free models"""
+            # Get filtered model choices
+            new_choices = get_model_choices(filter_free=filter_free)
+
+            # Try to preserve current selection if it's in the new list
+            current_value = model_dropdown.value if hasattr(model_dropdown, 'value') else None
+            new_value = current_value if current_value in new_choices else (new_choices[0] if new_choices and new_choices != ["No models available"] else None)
+
+            return gr.update(choices=new_choices, value=new_value)
+
         model_dropdown.change(
             update_current_model,
             inputs=[model_dropdown],
             outputs=[model_info, token_usage_display]
+        )
+
+        # Free models toggle event handler
+        free_models_toggle.change(
+            handle_free_models_toggle,
+            inputs=[free_models_toggle],
+            outputs=[model_dropdown]
         )
 
         send_btn.click(
@@ -1143,16 +1180,6 @@ def create_interface():
             outputs=[users_list]
         )
 
-        # Logout button handler (only set up if auth is enabled and user is logged in)
-        if AUTH_ENABLED and current_user:
-            def handle_logout():
-                logout_user("")  # Clear session
-                return gr.HTML("<div style='color: green; text-align: center;'>Logged out successfully. Refresh the page to login again.</div>")
-
-            logout_btn.click(
-                handle_logout,
-                outputs=[user_display]
-            )
 
         # Initialize admin panel data on load
         def initialize_admin_panel():
@@ -1205,7 +1232,11 @@ def create_interface():
             outputs=[conversations_radio, model_info, token_usage_display, users_list, auth_status, active_sessions]
         )
 
-    return demo
+    # Return demo and user interface elements for wrapper access
+    if AUTH_ENABLED:
+        return demo, user_display, logout_btn
+    else:
+        return demo, None, None
 
 def initialize_app():
     """Initialize application globals - called both by main() and when imported for Gradio CLI"""
@@ -1241,6 +1272,14 @@ def initialize_app():
             if AUTH_ENABLED:
                 print("Initializing user service...")
                 user_service = UserService(db_service)
+
+                # Initialize auth service with database
+                print("Initializing auth service with database...")
+                global auth_service
+                auth_service = AuthService(db_service)
+
+                # Start session cleanup background task
+                start_session_cleanup_task()
 
                 # Ensure default admin user exists
                 admin_user = user_service.ensure_default_admin()
@@ -1282,6 +1321,28 @@ def initialize_app():
 
     return True
 
+def start_session_cleanup_task():
+    """Start background task to cleanup expired sessions"""
+    def cleanup_worker():
+        while True:
+            try:
+                if auth_service:
+                    cleaned_count = auth_service.cleanup_expired_sessions()
+                    if cleaned_count > 0:
+                        print(f"Cleaned up {cleaned_count} expired sessions")
+
+                # Sleep for 1 hour between cleanup runs
+                time.sleep(3600)
+            except Exception as e:
+                print(f"Session cleanup error: {e}")
+                # Sleep for 30 minutes on error before retrying
+                time.sleep(1800)
+
+    # Start cleanup thread as daemon so it stops when main app stops
+    cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
+    cleanup_thread.start()
+    print("Session cleanup task started")
+
 def create_app():
     """Create the main application with authentication wrapper"""
     if AUTH_ENABLED:
@@ -1289,7 +1350,7 @@ def create_app():
         login_demo, login_success, session_token = create_login_interface()
 
         # Create main chat interface
-        chat_demo = create_interface()
+        chat_demo, user_display, logout_btn = create_interface()
 
         # Create wrapper that shows login or chat based on authentication
         with gr.Blocks(title="Local GPT Chat") as app:
@@ -1300,34 +1361,143 @@ def create_app():
                 with gr.Column(visible=False) as chat_column:
                     chat_demo.render()
 
-            # Session state
-            session_state = gr.State("")
+            # Session state - use BrowserState for persistence across page refreshes
+            session_state = gr.BrowserState("", storage_key="session_token")
+
+            # Session restoration on startup
+            def restore_session(stored_token):
+                """Check if stored session token is still valid and restore session"""
+                print(f"[DEBUG] Restoring session with token: {stored_token}")
+
+                if stored_token and stored_token.strip():
+                    print(f"[DEBUG] Verifying session token...")
+                    if verify_session(stored_token):
+                        # Session is valid, show chat interface
+                        global current_user
+                        print(f"[DEBUG] Session valid, current user: {current_user.display_name if current_user else 'None'}")
+                        user_html = f"<div style='text-align: right; padding: 10px;'>👤 {current_user.display_name if current_user else 'Guest'}</div>"
+                        return (
+                            gr.update(visible=False),  # login_column
+                            gr.update(visible=True),   # chat_column
+                            stored_token,              # session_state (keep the token)
+                            gr.HTML(user_html)         # user_display
+                        )
+                    else:
+                        print(f"[DEBUG] Session invalid or expired")
+                else:
+                    print(f"[DEBUG] No token provided or empty token")
+
+                # Session invalid or expired, clear it and show login
+                return (
+                    gr.update(visible=True),   # login_column
+                    gr.update(visible=False),  # chat_column
+                    "",                        # session_state (clear token)
+                    gr.HTML("<div style='text-align: right; padding: 10px;'>👤 Guest</div>")  # user_display
+                )
 
             # Handle successful login
             def show_chat_interface(success, token):
                 if success and verify_session(token):
+                    # Get current user and update display
+                    global current_user
+                    user_html = f"<div style='text-align: right; padding: 10px;'>👤 {current_user.display_name if current_user else 'Guest'}</div>"
                     return (
                         gr.update(visible=False),  # login_column
                         gr.update(visible=True),   # chat_column
-                        token                      # session_state
+                        token,                     # session_state
+                        gr.HTML(user_html)         # user_display
                     )
                 return (
                     gr.update(visible=True),   # login_column
                     gr.update(visible=False),  # chat_column
-                    ""                         # session_state
+                    "",                        # session_state
+                    gr.HTML("<div style='text-align: right; padding: 10px;'>👤 Guest</div>")  # user_display
                 )
 
-            # Monitor login success
+            # Connect login interface session token to wrapper session state
+            def sync_session_states(success, token):
+                """Sync session states and handle login success"""
+                if success and token:
+                    # Update both session states with the token
+                    result = show_chat_interface(success, token)
+                    return result
+                else:
+                    # Failed login - clear states
+                    return (
+                        gr.update(visible=True),   # login_column
+                        gr.update(visible=False),  # chat_column
+                        "",                        # session_state
+                        gr.HTML("<div style='text-align: right; padding: 10px;'>👤 Guest</div>")  # user_display
+                    )
+
+            # Monitor login success and sync states
             login_success.change(
-                show_chat_interface,
+                sync_session_states,
                 inputs=[login_success, session_token],
-                outputs=[login_column, chat_column, session_state]
+                outputs=[login_column, chat_column, session_state, user_display]
+            )
+
+            # Logout handler at wrapper level
+            def handle_logout(stored_token):
+                global current_user
+                if current_user:
+                    logout_user(stored_token)  # Pass actual session token
+                    current_user = None
+                    return (
+                        gr.update(visible=True),   # Show login column
+                        gr.update(visible=False),  # Hide chat column
+                        "",                        # Clear session state
+                        gr.HTML("<div style='text-align: right; padding: 10px;'>👤 Guest</div>")  # Reset user display
+                    )
+                return (
+                    gr.update(),  # No change to login column
+                    gr.update(),  # No change to chat column
+                    "",           # Clear session state
+                    gr.HTML("<div style='color: red; text-align: center;'>Not logged in.</div>")
+                )
+
+            # Connect logout button to wrapper-level handler
+            logout_btn.click(
+                handle_logout,
+                inputs=[session_state],
+                outputs=[login_column, chat_column, session_state, user_display]
+            )
+
+            # Initialize interface on load and handle session restoration
+            def initialize_auth_interface(stored_token):
+                """Initialize authentication interface and restore session if available"""
+                print(f"[DEBUG] Initializing auth interface with stored token: {stored_token}")
+                if stored_token:
+                    print(f"[DEBUG] Found stored token, attempting to restore session")
+                    return restore_session(stored_token)
+                else:
+                    print(f"[DEBUG] No stored token found, showing login interface")
+                    return (
+                        gr.update(visible=True),   # login_column
+                        gr.update(visible=False),  # chat_column
+                        "",                        # session_state
+                        gr.HTML("<div style='text-align: right; padding: 10px;'>👤 Guest</div>")  # user_display
+                    )
+
+            # Auto-restore session on page load
+            app.load(
+                initialize_auth_interface,
+                inputs=[session_state],
+                outputs=[login_column, chat_column, session_state, user_display]
+            )
+
+            # Also listen for session state changes for manual restoration
+            session_state.change(
+                restore_session,
+                inputs=[session_state],
+                outputs=[login_column, chat_column, session_state, user_display]
             )
 
         return app
     else:
         # No authentication - return main interface directly
-        return create_interface()
+        demo, _, _ = create_interface()
+        return demo
 
 def main():
     """Main function to run the application"""

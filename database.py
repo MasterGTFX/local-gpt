@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from contextlib import contextmanager
-from models import Base, User, UserPreference, Conversation, Message, FileAttachment
+from models import Base, User, UserPreference, Conversation, Message, FileAttachment, Session
 from typing import List, Tuple, Optional, Dict
 import os
 
@@ -281,3 +281,76 @@ class DatabaseService:
                 'created_at': att.created_at,
                 'message_id': str(att.message_id)
             } for att in attachments]
+
+    def create_session(self, user_id: str, token: str, expires_at, remember_me: bool = False) -> str:
+        """Create a new session"""
+        with self.get_session() as session:
+            db_session = Session(
+                user_id=user_id,
+                token=token,
+                expires_at=expires_at,
+                remember_me=remember_me
+            )
+            session.add(db_session)
+            session.flush()
+            return str(db_session.id)
+
+    def get_session_by_token(self, token: str) -> Optional[Dict]:
+        """Get session by token"""
+        with self.get_session() as session:
+            db_session = session.query(Session).filter(
+                Session.token == token
+            ).first()
+
+            if db_session:
+                return {
+                    'id': str(db_session.id),
+                    'user_id': str(db_session.user_id),
+                    'token': db_session.token,
+                    'expires_at': db_session.expires_at,
+                    'remember_me': db_session.remember_me,
+                    'created_at': db_session.created_at
+                }
+            return None
+
+    def delete_session(self, token: str) -> bool:
+        """Delete a session by token"""
+        with self.get_session() as session:
+            result = session.query(Session).filter(
+                Session.token == token
+            ).delete()
+            return result > 0
+
+    def cleanup_expired_sessions(self) -> int:
+        """Remove expired sessions and return count of deleted sessions"""
+        from datetime import datetime
+        with self.get_session() as session:
+            result = session.query(Session).filter(
+                Session.expires_at < datetime.utcnow()
+            ).delete()
+            return result
+
+    def get_user_sessions(self, user_id: str) -> List[Dict]:
+        """Get all active sessions for a user"""
+        from datetime import datetime
+        with self.get_session() as session:
+            sessions = session.query(Session).filter(
+                Session.user_id == user_id,
+                Session.expires_at > datetime.utcnow()
+            ).order_by(Session.created_at.desc()).all()
+
+            return [{
+                'id': str(s.id),
+                'token': s.token,
+                'expires_at': s.expires_at,
+                'remember_me': s.remember_me,
+                'created_at': s.created_at
+            } for s in sessions]
+
+    def delete_user_sessions(self, user_id: str) -> int:
+        """Delete all sessions for a user and return count of deleted sessions"""
+        with self.get_session() as session:
+            result = session.query(Session).filter(
+                Session.user_id == user_id
+            ).delete()
+            return result

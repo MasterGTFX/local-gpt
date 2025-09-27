@@ -22,6 +22,19 @@ class User(Base):
 
     conversations = relationship("Conversation", back_populates="user")
     preferences = relationship("UserPreference", back_populates="user")
+    sessions = relationship("Session", back_populates="user")
+
+class Session(Base):
+    __tablename__ = 'sessions'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id'), nullable=False)
+    token = Column(String(255), unique=True, nullable=False, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    remember_me = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="sessions")
 
 class UserPreference(Base):
     __tablename__ = 'user_preferences'

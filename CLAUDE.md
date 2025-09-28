@@ -55,3 +55,4 @@ According to README.md, the full planned architecture includes:
 Currently implemented: Basic Gradio chat interface with model selection
 Not yet implemented: Database storage, user authentication, conversation persistence
 - pythonic, clean, minimal code
+- Do not run main Gradio app - I will test it myself if you require so.

@@ -27,6 +27,23 @@ class DatabaseService:
 
         Base.metadata.create_all(bind=self.engine)
 
+    def rebuild_db(self):
+        """Drop and recreate all tables with current schema"""
+        print("Rebuilding database schema...")
+        try:
+            # Enable pgvector extension if available
+            with self.engine.connect() as conn:
+                conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                conn.commit()
+        except Exception:
+            # Skip if pgvector is not available
+            pass
+
+        # Drop all tables and recreate
+        Base.metadata.drop_all(bind=self.engine)
+        Base.metadata.create_all(bind=self.engine)
+        print("Database schema rebuilt successfully")
+
     @contextmanager
     def get_session(self):
         session = self.SessionLocal()
@@ -381,3 +398,28 @@ class DatabaseService:
                 Session.user_id == user_id
             ).delete()
             return result
+
+    def get_user_last_used_model(self, user_id: str) -> Optional[str]:
+        """Get the model ID from the user's most recent assistant message"""
+        if not user_id:
+            return None
+
+        with self.get_session() as session:
+            # Get the most recent conversation for this user
+            recent_conversation = session.query(Conversation).filter(
+                Conversation.user_id == user_id
+            ).order_by(Conversation.updated_at.desc()).first()
+
+            if not recent_conversation:
+                return None
+
+            # Get the most recent assistant message from that conversation
+            last_assistant_message = session.query(Message).filter(
+                Message.conversation_id == recent_conversation.id,
+                Message.message_data['role'].astext == 'assistant'
+            ).order_by(Message.created_at.desc()).first()
+
+            if last_assistant_message and last_assistant_message.model:
+                return last_assistant_message.model
+
+            return None

@@ -10,7 +10,6 @@ from user_preferences import get_preference, set_preference, load_preferences, c
 from file_processor import FileProcessor
 from user_service import UserService
 from auth import auth_service, AuthService
-from migrations import MigrationService
 
 # Load environment variables
 load_dotenv()
@@ -119,6 +118,17 @@ def extract_model_id(model_choice: str) -> str:
     # Fallback: return the model name
     return model_name
 
+def find_model_choice_by_id(model_id: str, model_choices: List[str]) -> Optional[str]:
+    """Find the model choice string that corresponds to a given model ID"""
+    if not model_id or not model_choices:
+        return None
+
+    for choice in model_choices:
+        if extract_model_id(choice) == model_id:
+            return choice
+
+    return None
+
 def messages_to_openai_format(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """Convert Gradio messages format to OpenAI API format"""
     return [{"role": msg["role"], "content": msg["content"]} for msg in messages if msg.get("content")]
@@ -126,6 +136,15 @@ def messages_to_openai_format(messages: List[Dict[str, str]]) -> List[Dict[str, 
 def send_message_to_llm(messages: List[Dict[str, str]], model_id: str) -> Tuple[str, Optional[Dict]]:
     """Send message to LLM API and get response with token usage"""
     try:
+        # Add user context to messages if available
+        enhanced_messages = messages.copy()
+        if current_user and hasattr(current_user, 'user_context') and current_user.user_context:
+            system_message = {
+                "role": "system",
+                "content": f"User context: {current_user.user_context}"
+            }
+            enhanced_messages = [system_message] + enhanced_messages
+
         headers = {
             "Authorization": f"Bearer {LLM_API_KEY}",
             "Content-Type": "application/json",
@@ -135,7 +154,7 @@ def send_message_to_llm(messages: List[Dict[str, str]], model_id: str) -> Tuple[
 
         data = {
             "model": model_id,
-            "messages": messages
+            "messages": enhanced_messages
         }
 
         response = requests.post(f"{LLM_BASE_URL}/chat/completions",
@@ -293,6 +312,35 @@ def refresh_conversations_for_user() -> List[Tuple[str, str]]:
     """Refresh conversation list for the current user - used after authentication"""
     print(f"[CONV] Refreshing conversations for current user: {current_user.username if current_user else 'None'}")
     return load_conversations_list("")
+
+def update_model_selection_for_user() -> str:
+    """Update model selection based on user's last used model from recent conversations"""
+    global current_user, db_service
+
+    if not (AUTH_ENABLED and current_user and db_service):
+        return None
+
+    try:
+        # Get the last used model ID from user's conversation history
+        last_used_model_id = db_service.get_user_last_used_model(str(current_user.id))
+
+        if last_used_model_id:
+            # Find the corresponding model choice string
+            model_choices = get_model_choices()
+            model_choice = find_model_choice_by_id(last_used_model_id, model_choices)
+
+            if model_choice:
+                print(f"[MODEL] Found last used model for {current_user.username}: {last_used_model_id}")
+                return model_choice
+            else:
+                print(f"[MODEL] Last used model {last_used_model_id} not found in current choices for {current_user.username}")
+        else:
+            print(f"[MODEL] No last used model found for {current_user.username}")
+
+    except Exception as e:
+        print(f"[MODEL] Error getting last used model for {current_user.username}: {e}")
+
+    return None
 
 def chat_function(message: str, history: List[Dict[str, str]], model_choice: str, uploaded_files: List[Dict] = None) -> Tuple[str, List[Dict[str, str]], List[Dict], gr.update]:
     """Handle chat messages with optional file attachments"""
@@ -556,6 +604,33 @@ def create_login_interface():
 
     return login_demo, login_success, session_token
 
+def create_user_display_html():
+    """Create HTML for user display with avatar and name"""
+    global current_user
+
+    if not current_user:
+        return "<div style='text-align: right; padding: 10px;'>👤 Guest</div>"
+
+    display_name = current_user.display_name or "User"
+
+    # Check if user has avatar
+    avatar_html = ""
+    if hasattr(current_user, 'avatar_url') and current_user.avatar_url:
+        import os
+        if os.path.exists(current_user.avatar_url):
+            avatar_html = f"<img src='file={current_user.avatar_url}' style='width: 32px; height: 32px; border-radius: 50%; margin-right: 8px; vertical-align: middle;' />"
+
+    if not avatar_html:
+        # Use emoji if no avatar
+        avatar_html = "<span style='font-size: 24px; margin-right: 8px; vertical-align: middle;'>👤</span>"
+
+    return f"""
+    <div style='text-align: right; padding: 10px; display: flex; align-items: center; justify-content: flex-end;'>
+        {avatar_html}
+        <span style='font-weight: 500;'>{display_name}</span>
+    </div>
+    """
+
 def create_interface():
     """Create the Gradio interface"""
     global user_preferences
@@ -611,21 +686,17 @@ def create_interface():
                         if AUTH_ENABLED:
                             with gr.Row() as user_controls_row:
                                 user_display = gr.HTML("<div style='text-align: right; padding: 10px;'>👤 Guest</div>")
+                                profile_btn = gr.Button("👤 Profile", variant="secondary", size="sm", visible=True)
                                 admin_panel_btn = gr.Button("Admin Panel", variant="secondary", size="sm", visible=False)
                                 logout_btn = gr.Button("Logout", variant="secondary", size="sm")
                     with gr.Column(scale=3):
                         # Model selection with free models toggle
                         with gr.Row():
                             with gr.Column(scale=6):
-                                # Get saved model preference or default to first available
-                                saved_model = user_preferences.get("last_selected_model")
+                                # Get model choices and default to first available
+                                # Note: Proper last-used model will be set after user authentication
                                 model_choices = get_model_choices()
-                                default_model = None
-
-                                if saved_model and saved_model in model_choices:
-                                    default_model = saved_model
-                                elif model_choices != ["No models available"]:
-                                    default_model = model_choices[0]
+                                default_model = model_choices[0] if model_choices != ["No models available"] else None
 
                                 model_dropdown = gr.Dropdown(
                                     choices=model_choices,
@@ -708,6 +779,50 @@ def create_interface():
                 # Model info in a collapsible section
                 with gr.Accordion("Model Information", open=False):
                     model_info = gr.Markdown("Select a model to see its description.")
+
+                # User Profile Panel - visible when authenticated
+                profile_panel_visible = AUTH_ENABLED
+                with gr.Accordion("👤 User Profile", open=False, visible=profile_panel_visible) as profile_accordion:
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            # Avatar section
+                            gr.HTML("<h4>Profile Picture</h4>")
+                            current_avatar = gr.Image(
+                                label="Current Avatar",
+                                height=150,
+                                width=150,
+                                interactive=False,
+                                show_label=False,
+                                container=True
+                            )
+                            avatar_upload = gr.File(
+                                label="📸 Upload New Avatar",
+                                file_types=[".jpg", ".jpeg", ".png", ".gif", ".webp"],
+                                file_count="single",
+                                container=True
+                            )
+
+                        with gr.Column(scale=2):
+                            # Profile information
+                            gr.HTML("<h4>Profile Information</h4>")
+                            profile_display_name = gr.Textbox(
+                                label="Display Name",
+                                placeholder="Enter your display name",
+                                container=True
+                            )
+                            profile_user_context = gr.Textbox(
+                                label="About You (for AI context)",
+                                placeholder="Tell the AI about yourself for better conversations...",
+                                lines=4,
+                                container=True,
+                                info="This information will be shared with the AI to provide more personalized responses"
+                            )
+
+                            with gr.Row():
+                                save_profile_btn = gr.Button("Save Profile", variant="primary")
+                                reset_profile_btn = gr.Button("Reset", variant="secondary")
+
+                            profile_message = gr.HTML("")
 
                 # Admin Panel - always create but only visible to admins
                 admin_panel_visible = AUTH_ENABLED and current_user and current_user.is_admin
@@ -816,7 +931,7 @@ def create_interface():
                     else:
                         token_display = "0"
                         error = file_data['error'][:40] + "..." if len(file_data['error']) > 40 else file_data['error']
-                        status = f"❌ {error}"
+                        status = f"ERROR: {error}"
 
                     table_data.append([filename, size_display, token_display, status])
 
@@ -960,8 +1075,7 @@ def create_interface():
             """Update the current model choice for retry functionality"""
             global current_model_choice
             current_model_choice = model_choice
-            # Save model preference
-            set_preference("last_selected_model", model_choice)
+            # Note: Model preference is now tracked automatically via conversation history
             return update_model_info(model_choice), update_token_display(model_choice)
 
         # Admin Panel Functions
@@ -970,10 +1084,10 @@ def create_interface():
             global user_service, current_user
 
             if not current_user or not current_user.is_admin:
-                return "", "❌ Admin access required"
+                return "", "ERROR: Admin access required"
 
             if not username or not password:
-                return "", "❌ Username and password are required"
+                return "", "ERROR: Username and password are required"
 
             try:
                 user_service.create_user(
@@ -984,37 +1098,37 @@ def create_interface():
                 )
                 return "", f"✅ User '{username}' created successfully"
             except ValueError as e:
-                return "", f"❌ {str(e)}"
+                return "", f"ERROR: {str(e)}"
             except Exception as e:
-                return "", f"❌ Error creating user: {str(e)}"
+                return "", f"ERROR: Error creating user: {str(e)}"
 
         def delete_user_by_username(username):
             """Delete a user by username (admin only)"""
             global user_service, current_user
 
             if not current_user or not current_user.is_admin:
-                return "", "❌ Admin access required"
+                return "", "ERROR: Admin access required"
 
             if not username:
-                return "", "❌ Username is required"
+                return "", "ERROR: Username is required"
 
             if username == current_user.username:
-                return "", "❌ Cannot delete your own account"
+                return "", "ERROR: Cannot delete your own account"
 
             try:
                 # Find user by username
                 target_user = user_service.get_user_by_username(username)
                 if not target_user:
-                    return "", f"❌ User '{username}' not found"
+                    return "", f"ERROR: User '{username}' not found"
 
                 # Delete the user
                 success = user_service.delete_user(str(target_user.id))
                 if success:
                     return "", f"✅ User '{username}' deleted successfully"
                 else:
-                    return "", f"❌ Failed to delete user '{username}'"
+                    return "", f"ERROR: Failed to delete user '{username}'"
             except Exception as e:
-                return "", f"❌ Error deleting user: {str(e)}"
+                return "", f"ERROR: Error deleting user: {str(e)}"
 
         def load_users_list():
             """Load list of all users for admin panel"""
@@ -1044,7 +1158,7 @@ def create_interface():
             global current_user
 
             if not current_user or not current_user.is_admin:
-                return "❌ Admin access required", "❌ Admin access required"
+                return "ERROR: Admin access required", "ERROR: Admin access required"
 
             try:
                 # Get session count
@@ -1056,12 +1170,108 @@ def create_interface():
 
                 return auth_text, sessions_text
             except Exception as e:
-                error_msg = f"❌ Error: {str(e)}"
+                error_msg = f"ERROR: Error: {str(e)}"
                 return error_msg, error_msg
 
         def clear_user_form():
             """Clear the user creation form"""
             return "", "", "", False, ""
+
+        # Profile Functions
+        def load_user_profile():
+            """Load current user's profile data"""
+            global current_user
+            if not current_user:
+                return "", "", None, "ERROR: Not logged in"
+
+            display_name = current_user.display_name or ""
+            user_context = getattr(current_user, 'user_context', None) or ""
+
+            # Load avatar if it exists
+            avatar_path = None
+            if hasattr(current_user, 'avatar_url') and current_user.avatar_url:
+                import os
+                if os.path.exists(current_user.avatar_url):
+                    avatar_path = current_user.avatar_url
+
+            return display_name, user_context, avatar_path, ""
+
+        def save_user_profile(display_name, user_context):
+            """Save user profile changes"""
+            global current_user, user_service
+
+            if not current_user or not user_service:
+                return "ERROR: Not logged in or service unavailable"
+
+            try:
+                success = user_service.update_user_profile(
+                    str(current_user.id),
+                    display_name=display_name,
+                    user_context=user_context
+                )
+
+                if success:
+                    # Update current user object
+                    current_user.display_name = display_name
+                    if hasattr(current_user, 'user_context'):
+                        current_user.user_context = user_context
+                    return "✅ Profile updated successfully"
+                else:
+                    return "ERROR: Failed to update profile"
+
+            except Exception as e:
+                return f"ERROR: Error: {str(e)}"
+
+        def handle_avatar_upload(file):
+            """Handle avatar file upload"""
+            global current_user, user_service, file_processor
+
+            if not current_user or not user_service:
+                return None, "ERROR: Not logged in"
+
+            if not file:
+                return None, ""
+
+            try:
+                import os
+                import shutil
+                from datetime import datetime
+
+                # Create avatars directory if it doesn't exist
+                avatars_dir = "uploads/avatars"
+                os.makedirs(avatars_dir, exist_ok=True)
+
+                # Generate unique filename
+                file_ext = os.path.splitext(file.name)[1].lower()
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"avatar_{current_user.id}_{timestamp}{file_ext}"
+                avatar_path = os.path.join(avatars_dir, filename)
+
+                # Copy uploaded file to avatar location
+                shutil.copy2(file.name, avatar_path)
+
+                # Update user's avatar URL in database
+                success = user_service.update_avatar(str(current_user.id), avatar_path)
+
+                if success:
+                    # Update current user object
+                    current_user.avatar_url = avatar_path
+                    return avatar_path, "✅ Avatar updated successfully"
+                else:
+                    return None, "ERROR: Failed to save avatar"
+
+            except Exception as e:
+                return None, f"ERROR: Error uploading avatar: {str(e)}"
+
+        def toggle_profile_panel():
+            """Toggle profile panel visibility and load data"""
+            profile_data = load_user_profile()
+            return profile_data
+
+        def reset_profile_form():
+            """Reset profile form to current saved values"""
+            return load_user_profile()
+
 
         def load_conversation_by_id(conversation_id: str, search_query: str = "") -> Tuple[List[Dict[str, str]], List[Tuple[str, str]]]:
             """Load a specific conversation by ID"""
@@ -1237,6 +1447,37 @@ def create_interface():
             outputs=[uploaded_files_state, uploaded_files_table, token_usage_display]
         )
 
+        # Profile Panel Event Handlers
+        profile_btn.click(
+            load_user_profile,
+            inputs=[],
+            outputs=[profile_display_name, profile_user_context, current_avatar, profile_message]
+        )
+
+        save_profile_btn.click(
+            save_user_profile,
+            inputs=[profile_display_name, profile_user_context],
+            outputs=[profile_message]
+        ).then(
+            lambda: create_user_display_html(),
+            outputs=[user_display]
+        )
+
+        reset_profile_btn.click(
+            reset_profile_form,
+            inputs=[],
+            outputs=[profile_display_name, profile_user_context, current_avatar, profile_message]
+        )
+
+        avatar_upload.change(
+            handle_avatar_upload,
+            inputs=[avatar_upload],
+            outputs=[current_avatar, profile_message]
+        ).then(
+            lambda: create_user_display_html(),
+            outputs=[user_display]
+        )
+
         # Admin Panel Event Handlers - always set up but conditionally functional
         # Create user button
         create_user_btn.click(
@@ -1350,16 +1591,16 @@ def create_interface():
 
     # Return demo and user interface elements for wrapper access
     if AUTH_ENABLED:
-        return demo, user_display, logout_btn, conversations_radio
+        return demo, user_display, logout_btn, conversations_radio, model_dropdown
     else:
-        return demo, None, None, None
+        return demo, None, None, None, None
 
 def initialize_app():
     """Initialize application globals - called both by main() and when imported for Gradio CLI"""
     global db_service, user_service, user_preferences, available_models, file_processor, AUTH_ENABLED
 
     if not LLM_API_KEY:
-        print("❌ Error: LLM_API_KEY not found in environment variables")
+        print("ERROR: Error: LLM_API_KEY not found in environment variables")
         print("Please copy .env.example to .env and add your LLM API key")
         return False
 
@@ -1368,18 +1609,6 @@ def initialize_app():
         try:
             print("Initializing database...")
             db_service = DatabaseService()
-
-            # Run migrations if authentication is enabled
-            if AUTH_ENABLED:
-                print("Authentication enabled - checking for migrations...")
-                migration_service = MigrationService()
-                if migration_service.check_migration_needed():
-                    print("Running database migrations...")
-                    if not migration_service.run_migrations():
-                        print("❌ Database migration failed")
-                        return False
-                else:
-                    print("Database is up to date")
 
             db_service.init_db()
             print("Database initialized successfully")
@@ -1405,12 +1634,12 @@ def initialize_app():
             print(f"Warning: Could not initialize database: {e}")
             print("Conversations will not be saved")
             if AUTH_ENABLED:
-                print("❌ Authentication requires database - disabling authentication")
+                print("Authentication requires database - disabling authentication")
                 AUTH_ENABLED = False
     else:
         print("No DATABASE_URL found. Conversations will not be saved")
         if AUTH_ENABLED:
-            print("❌ Authentication requires database - disabling authentication")
+            print("Authentication requires database - disabling authentication")
             AUTH_ENABLED = False
 
     # Load user preferences (file-based if no authentication)
@@ -1466,7 +1695,7 @@ def create_app():
         login_demo, login_success, session_token = create_login_interface()
 
         # Create main chat interface
-        chat_demo, user_display, logout_btn, conversations_radio = create_interface()
+        chat_demo, user_display, logout_btn, conversations_radio, model_dropdown = create_interface()
 
         # Create wrapper that shows login or chat based on authentication
         with gr.Blocks(title="Local GPT Chat") as app:
@@ -1491,7 +1720,7 @@ def create_app():
                         # Session is valid, show chat interface
                         global current_user
                         print(f"[DEBUG] Session valid, current user: {current_user.display_name if current_user else 'None'}")
-                        user_html = f"<div style='text-align: right; padding: 10px;'>👤 {current_user.display_name if current_user else 'Guest'}</div>"
+                        user_html = create_user_display_html()
                         return (
                             gr.update(visible=False),  # login_column
                             gr.update(visible=True),   # chat_column
@@ -1516,7 +1745,7 @@ def create_app():
                 if success and verify_session(token):
                     # Get current user and update display
                     global current_user
-                    user_html = f"<div style='text-align: right; padding: 10px;'>👤 {current_user.display_name if current_user else 'Guest'}</div>"
+                    user_html = create_user_display_html()
                     return (
                         gr.update(visible=False),  # login_column
                         gr.update(visible=True),   # chat_column
@@ -1553,15 +1782,31 @@ def create_app():
                 # Always try to refresh - if no user is authenticated, load_conversations_list will return empty list
                 return gr.update(choices=load_conversations_list(""))
 
+            def refresh_conversations_and_model_after_auth():
+                """Refresh conversation list and update model selection after authentication events"""
+                print(f"[AUTH] Refreshing conversations and model after authentication event")
+
+                # Refresh conversations
+                conversations_update = gr.update(choices=load_conversations_list(""))
+
+                # Update model selection for the authenticated user
+                last_used_model = update_model_selection_for_user()
+                if last_used_model:
+                    model_update = gr.update(value=last_used_model)
+                else:
+                    model_update = gr.update()  # No change if no last used model found
+
+                return conversations_update, model_update
+
             # Monitor login success and sync states
             login_success.change(
                 sync_session_states,
                 inputs=[login_success, session_token],
                 outputs=[login_column, chat_column, session_state, user_display]
             ).then(
-                refresh_conversations_after_auth,
+                refresh_conversations_and_model_after_auth,
                 inputs=[],
-                outputs=[conversations_radio]
+                outputs=[conversations_radio, model_dropdown]
             )
 
             # Logout handler at wrapper level
@@ -1612,9 +1857,9 @@ def create_app():
                 inputs=[session_state],
                 outputs=[login_column, chat_column, session_state, user_display]
             ).then(
-                refresh_conversations_after_auth,
+                refresh_conversations_and_model_after_auth,
                 inputs=[],
-                outputs=[conversations_radio]
+                outputs=[conversations_radio, model_dropdown]
             )
 
             # Also listen for session state changes for manual restoration
@@ -1623,15 +1868,15 @@ def create_app():
                 inputs=[session_state],
                 outputs=[login_column, chat_column, session_state, user_display]
             ).then(
-                refresh_conversations_after_auth,
+                refresh_conversations_and_model_after_auth,
                 inputs=[],
-                outputs=[conversations_radio]
+                outputs=[conversations_radio, model_dropdown]
             )
 
         return app
     else:
         # No authentication - return main interface directly
-        demo, _, _, _ = create_interface()
+        demo, _, _, _, _ = create_interface()
         return demo
 
 def main():

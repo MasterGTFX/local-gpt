@@ -93,15 +93,27 @@ class UserService:
                 return True
             return False
 
-    def update_user_profile(self, user_id: str, display_name: str = None) -> bool:
+    def update_user_profile(self, user_id: str, display_name: str = None, avatar_url: str = None, user_context: str = None) -> bool:
         """Update user profile information"""
         with self.db_service.get_session() as session:
             user = session.query(User).filter(User.id == user_id).first()
             if user:
                 if display_name is not None:
                     user.display_name = display_name
+                if avatar_url is not None:
+                    user.avatar_url = avatar_url
+                if user_context is not None:
+                    user.user_context = user_context
                 return True
             return False
+
+    def update_avatar(self, user_id: str, avatar_url: str) -> bool:
+        """Update user avatar"""
+        return self.update_user_profile(user_id, avatar_url=avatar_url)
+
+    def update_user_context(self, user_id: str, user_context: str) -> bool:
+        """Update user context for LLM"""
+        return self.update_user_profile(user_id, user_context=user_context)
 
     def deactivate_user(self, user_id: str) -> bool:
         """Deactivate a user (admin only)"""

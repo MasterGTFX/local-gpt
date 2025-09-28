@@ -15,6 +15,8 @@ class User(Base):
     username = Column(String(50), unique=True, nullable=True)  # nullable for default user
     password_hash = Column(String(255))
     display_name = Column(String(100))
+    avatar_url = Column(String(500), nullable=True)  # Path to uploaded avatar image
+    user_context = Column(Text, nullable=True)  # User description for LLM context
     is_admin = Column(Boolean, default=False)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)

@@ -3,6 +3,8 @@ import requests
 import gradio as gr
 import threading
 import time
+import base64
+import mimetypes
 from dotenv import load_dotenv
 from typing import List, Dict, Tuple, Optional
 from database import DatabaseService
@@ -119,6 +121,44 @@ def extract_model_id(model_choice: str) -> str:
     # Fallback: return the model name
     return model_name
 
+def encode_image_to_base64(image_path: str) -> str:
+    """Encode an image file to base64 string"""
+    try:
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    except Exception as e:
+        print(f"Error encoding image {image_path}: {e}")
+        return ""
+
+def create_image_message_content(text: str, image_path: str) -> List[Dict]:
+    """Create message content with both text and image for OpenAI API"""
+    content = []
+
+    if text and text.strip():
+        content.append({
+            "type": "text",
+            "text": text
+        })
+
+    if image_path:
+        # Get MIME type
+        mime_type, _ = mimetypes.guess_type(image_path)
+        if not mime_type or not mime_type.startswith('image/'):
+            mime_type = "image/jpeg"  # Default fallback
+
+        # Encode image
+        base64_image = encode_image_to_base64(image_path)
+        if base64_image:
+            data_url = f"data:{mime_type};base64,{base64_image}"
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": data_url
+                }
+            })
+
+    return content
+
 def find_model_choice_by_id(model_id: str, model_choices: List[str]) -> Optional[str]:
     """Find the model choice string that corresponds to a given model ID"""
     if not model_id or not model_choices:
@@ -130,9 +170,15 @@ def find_model_choice_by_id(model_id: str, model_choices: List[str]) -> Optional
 
     return None
 
-def messages_to_openai_format(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def messages_to_openai_format(messages: List[Dict]) -> List[Dict]:
     """Convert Gradio messages format to OpenAI API format"""
-    return [{"role": msg["role"], "content": msg["content"]} for msg in messages if msg.get("content")]
+    formatted_messages = []
+    for msg in messages:
+        if msg.get("content"):
+            # Handle both string content and structured content (for images)
+            formatted_message = {"role": msg["role"], "content": msg["content"]}
+            formatted_messages.append(formatted_message)
+    return formatted_messages
 
 def send_message_to_llm(messages: List[Dict[str, str]], model_id: str, selected_system_prompt: str = None) -> Tuple[str, Optional[Dict]]:
     """Send message to LLM API and get response with token usage"""
@@ -387,20 +433,20 @@ def update_system_prompt_selection_for_user() -> str:
 
     return "General Assistant"  # Default fallback
 
-def chat_function(message: str, history: List[Dict[str, str]], model_choice: str, system_prompt_choice: str, uploaded_files: List[Dict] = None) -> Tuple[str, List[Dict[str, str]], List[Dict], gr.update]:
+def chat_function(message: str, history: List[Dict[str, str]], model_choice: str, system_prompt_choice: str, uploaded_files: List[Dict] = None, image_file = None) -> Tuple[str, List[Dict[str, str]], List[Dict], gr.update, None]:
     """Handle chat messages with optional file attachments"""
     global db_service, current_conversation_id, file_processor
 
     if not LLM_API_KEY:
         error_msg = {"role": "assistant", "content": "Error: Please set your LLM_API_KEY in the .env file"}
-        return "", history + [error_msg], [], gr.update(visible=False, value=[])
+        return "", history + [error_msg], [], gr.update(visible=False, value=[]), None
 
-    if not message.strip():
-        return "", history, uploaded_files or [], gr.update()
+    if not message.strip() and not image_file:
+        return "", history, uploaded_files or [], gr.update(), image_file
 
     if model_choice == "No models available":
         error_msg = {"role": "assistant", "content": "Error: No models available. Please check your API key."}
-        return "", history + [error_msg], [], gr.update(visible=False, value=[])
+        return "", history + [error_msg], [], gr.update(visible=False, value=[]), None
 
     model_id = extract_model_id(model_choice)
 
@@ -411,8 +457,20 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
         # Format files for LLM context
         file_context = file_processor.format_files_for_llm_context(processed_files)
 
-    # Prepare the actual message for the LLM (combining user message with file context)
-    if file_context:
+    # Handle image input if provided
+    image_path = None
+    if image_file and hasattr(image_file, 'name'):
+        image_path = image_file.name
+
+    # Prepare the actual message for the LLM
+    if image_path:
+        # Create structured content for image + text
+        llm_message_content = create_image_message_content(
+            f"{file_context}\n\n[USER MESSAGE]\n{message}" if file_context else message,
+            image_path
+        )
+        llm_message = llm_message_content
+    elif file_context:
         llm_message = f"{file_context}\n\n[USER MESSAGE]\n{message}"
     else:
         llm_message = message
@@ -429,7 +487,8 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
             print(f"Error setting conversation title: {e}")
 
     # Add user message to history (display the original message, not the one with file context)
-    user_message = {"role": "user", "content": message}
+    # For display purposes, keep it simple - just the text message
+    user_message = {"role": "user", "content": message + (" 📷" if image_path else "")}
     updated_history = history + [user_message]
 
     # Save user message to database and get message ID for file attachments
@@ -449,8 +508,8 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
                 except Exception as e:
                     print(f"Error saving file attachment: {e}")
 
-    # Convert to OpenAI format and get AI response (use llm_message with file context)
-    # Create a temporary history with the file context message for the LLM
+    # Convert to OpenAI format and get AI response (use llm_message with file context/image)
+    # Create a temporary history with the structured message for the LLM
     temp_history = history + [{"role": "user", "content": llm_message}]
     openai_messages = messages_to_openai_format(temp_history)
     response, usage = send_message_to_llm(openai_messages, model_id, system_prompt_choice)
@@ -472,8 +531,8 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
         except Exception as e:
             print(f"Error saving assistant message: {e}")
 
-    # Clear uploaded files after successful processing and return empty state
-    return "", final_history, [], gr.update(visible=False, value=[])
+    # Clear uploaded files and image after successful processing and return empty state
+    return "", final_history, [], gr.update(visible=False, value=[]), None
 
 def authenticate_user(username: str, password: str, remember_me: bool = False) -> Tuple[bool, str, str]:
     """Authenticate user and create session"""
@@ -769,12 +828,14 @@ def create_interface():
                             allow_custom_value=True
                         )
 
+
                         # Free models toggle - below system prompt selector
                         free_models_toggle = gr.Checkbox(
-                            label="🆓 Show only free models",
+                            label="🆓 FREE",
                             value=False,
                             container=False
                         )
+
 
                 # Token usage display
                 with gr.Row():
@@ -794,38 +855,40 @@ def create_interface():
                     show_copy_button=True
                 )
 
-                # Input area - message bar with send button
+                # Input area - message bar with image upload and send button
                 with gr.Row():
                     msg_input = gr.Textbox(
                         placeholder="Message Local GPT...",
-                        show_label=False,
-                        scale=6,
+                        show_label=True,
+                        scale=5,
                         container=False,
-                        lines=2,
-                        max_lines=4
+                        lines=7,
+                        max_lines=12
                     )
+                    with gr.Column(scale=1, min_width=120):
+                        image_input = gr.File(
+                            file_types=[".png", ".jpg", ".jpeg", ".gif", ".webp"],
+                            file_count="single",
+                            label="📷 Image",
+                            container=True,
+                            height=150,
+                            show_label=False,
+                            interactive=True
+                        )
                     with gr.Column(scale=1):
                         send_btn = gr.Button("Send", variant="primary", size="lg")
-                        clear_btn = gr.Button("Clear", variant="secondary", size="lg")
-
+                        new_chat_btn = gr.Button("+ New Chat", variant="secondary", size="lg")
+                        delete_chat_btn = gr.Button("- Delete", variant="stop", size="lg")
                 # File upload area and buttons row
                 with gr.Row():
-                    with gr.Column(scale=8):
+                    with gr.Column(scale=5):
                         file_upload = gr.File(
                             file_count="multiple",
                             label="📎 Attach Files (Max 50MB each)",
-                            file_types=[
-                                ".pdf", ".docx", ".pptx", ".xlsx", ".doc", ".ppt", ".xls",
-                                ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp",
-                                ".mp3", ".wav", ".m4a", ".ogg", ".flac",
-                                ".txt", ".md", ".html", ".htm", ".csv", ".json", ".xml", ".yaml", ".yml",
-                                ".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".css", ".sql"
-                            ],
                             container=True,
-                            interactive=True
+                            interactive=True,
+                            height=150
                         )
-                    with gr.Column(scale=2):
-                        new_chat_btn = gr.Button("+ New Chat", variant="stop", size="lg")
 
                 # File status display
                 with gr.Row():
@@ -1051,6 +1114,10 @@ def create_interface():
             """Clear uploaded files"""
             return [], gr.update(visible=False, value=[])
 
+        def clear_uploaded_files_and_image():
+            """Clear uploaded files and image input"""
+            return [], gr.update(visible=False, value=[]), None
+
         def update_model_info(model_choice):
             if not model_choice or model_choice == "No models available":
                 return "Select a model to see its description."
@@ -1087,16 +1154,6 @@ def create_interface():
 
             return "Model information not found."
 
-        def clear_conversation():
-            """Clear the conversation history and start a new conversation"""
-            # Check if user context changed and refresh if needed
-            if check_conversations_need_refresh():
-                print(f"[CONV] User context changed during clear conversation")
-
-            global current_conversation_id, current_conversation_tokens
-            current_conversation_id = None  # This will trigger creation of new conversation on next message
-            current_conversation_tokens = 0
-            return []
 
         def handle_edit(history: List[Dict[str, str]], edit_data: gr.EditData) -> List[Dict[str, str]]:
             """Handle message editing - only updates the specific message"""
@@ -1490,8 +1547,8 @@ def create_interface():
 
         send_btn.click(
             chat_function,
-            inputs=[msg_input, chatbot, model_dropdown, system_prompt_dropdown, uploaded_files_state],
-            outputs=[msg_input, chatbot, uploaded_files_state, uploaded_files_table]
+            inputs=[msg_input, chatbot, model_dropdown, system_prompt_dropdown, uploaded_files_state, image_input],
+            outputs=[msg_input, chatbot, uploaded_files_state, uploaded_files_table, image_input]
         ).then(
             lambda search_query: gr.update(choices=load_conversations_list(search_query)),
             inputs=[search_input],
@@ -1504,8 +1561,8 @@ def create_interface():
 
         msg_input.submit(
             chat_function,
-            inputs=[msg_input, chatbot, model_dropdown, system_prompt_dropdown, uploaded_files_state],
-            outputs=[msg_input, chatbot, uploaded_files_state, uploaded_files_table]
+            inputs=[msg_input, chatbot, model_dropdown, system_prompt_dropdown, uploaded_files_state, image_input],
+            outputs=[msg_input, chatbot, uploaded_files_state, uploaded_files_table, image_input]
         ).then(
             lambda search_query: gr.update(choices=load_conversations_list(search_query)),
             inputs=[search_input],
@@ -1516,19 +1573,6 @@ def create_interface():
             outputs=[token_usage_display]
         )
 
-        clear_btn.click(
-            clear_conversation,
-            inputs=[],
-            outputs=[chatbot]
-        ).then(
-            lambda search_query: gr.update(choices=load_conversations_list(search_query), value=None),
-            inputs=[search_input],
-            outputs=[conversations_radio]
-        ).then(
-            clear_uploaded_files,
-            inputs=[],
-            outputs=[uploaded_files_state, uploaded_files_table]
-        )
 
         new_chat_btn.click(
             start_new_conversation,
@@ -1539,9 +1583,9 @@ def create_interface():
             inputs=[search_input],
             outputs=[conversations_radio]
         ).then(
-            clear_uploaded_files,
+            clear_uploaded_files_and_image,
             inputs=[],
-            outputs=[uploaded_files_state, uploaded_files_table]
+            outputs=[uploaded_files_state, uploaded_files_table, image_input]
         )
 
         # Conversation selection handler
@@ -1551,7 +1595,7 @@ def create_interface():
             if check_conversations_need_refresh():
                 print(f"[CONV] User context changed during conversation selection, refreshing")
                 # Don't select a conversation if user context changed - just refresh the list
-                return [], "", [], gr.update(visible=False, value=[]), "General Assistant"
+                return [], "", [], gr.update(visible=False, value=[]), "General Assistant", None
 
             if selected:
                 global current_conversation_id, current_conversation_tokens
@@ -1569,13 +1613,13 @@ def create_interface():
                     except Exception as e:
                         print(f"[CONV] Error loading system prompt for conversation: {e}")
 
-                return messages, "", [], gr.update(visible=False, value=[]), conversation_system_prompt  # Clear search and uploaded files when selecting conversation
-            return [], "", [], gr.update(visible=False, value=[]), "General Assistant"
+                return messages, "", [], gr.update(visible=False, value=[]), conversation_system_prompt, None  # Clear search, uploaded files, and image when selecting conversation
+            return [], "", [], gr.update(visible=False, value=[]), "General Assistant", None
 
         conversations_radio.change(
             handle_conversation_selection,
             inputs=[conversations_radio],
-            outputs=[chatbot, search_input, uploaded_files_state, uploaded_files_table, system_prompt_dropdown]
+            outputs=[chatbot, search_input, uploaded_files_state, uploaded_files_table, system_prompt_dropdown, image_input]
         ).then(
             lambda: gr.update(choices=load_conversations_list("")),
             outputs=[conversations_radio]
@@ -1632,35 +1676,36 @@ def create_interface():
         )
 
         # Profile Panel Event Handlers
-        profile_btn.click(
-            load_user_profile,
-            inputs=[],
-            outputs=[profile_display_name, profile_user_context, current_avatar, profile_message]
-        )
+        if AUTH_ENABLED:
+            profile_btn.click(
+                load_user_profile,
+                inputs=[],
+                outputs=[profile_display_name, profile_user_context, current_avatar, profile_message]
+            )
 
-        save_profile_btn.click(
-            save_user_profile,
-            inputs=[profile_display_name, profile_user_context],
-            outputs=[profile_message]
-        ).then(
-            lambda: create_user_display_html(),
-            outputs=[user_display]
-        )
+            save_profile_btn.click(
+                save_user_profile,
+                inputs=[profile_display_name, profile_user_context],
+                outputs=[profile_message]
+            ).then(
+                lambda: create_user_display_html(),
+                outputs=[user_display]
+            )
 
-        reset_profile_btn.click(
-            reset_profile_form,
-            inputs=[],
-            outputs=[profile_display_name, profile_user_context, current_avatar, profile_message]
-        )
+            reset_profile_btn.click(
+                reset_profile_form,
+                inputs=[],
+                outputs=[profile_display_name, profile_user_context, current_avatar, profile_message]
+            )
 
-        avatar_upload.change(
-            handle_avatar_upload,
-            inputs=[avatar_upload],
-            outputs=[current_avatar, profile_message]
-        ).then(
-            lambda: create_user_display_html(),
-            outputs=[user_display]
-        )
+            avatar_upload.change(
+                handle_avatar_upload,
+                inputs=[avatar_upload],
+                outputs=[current_avatar, profile_message]
+            ).then(
+                lambda: create_user_display_html(),
+                outputs=[user_display]
+            )
 
         # Admin Panel Event Handlers - always set up but conditionally functional
         # Create user button

@@ -268,5 +268,7 @@ class UserService:
         return {
             "last_selected_model": None,
             "sidebar_visible": True,
-            "theme": "glass"
+            "theme": "glass",
+            "selected_system_prompt": "General Assistant",
+            "custom_system_prompts": {}
         }

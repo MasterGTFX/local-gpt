@@ -10,6 +10,7 @@ from user_preferences import get_preference, set_preference, load_preferences, c
 from file_processor import FileProcessor
 from user_service import UserService
 from auth import auth_service, AuthService
+from system_prompts import get_predefined_prompts, get_prompt_by_display_name, get_display_names
 
 # Load environment variables
 load_dotenv()
@@ -133,15 +134,37 @@ def messages_to_openai_format(messages: List[Dict[str, str]]) -> List[Dict[str, 
     """Convert Gradio messages format to OpenAI API format"""
     return [{"role": msg["role"], "content": msg["content"]} for msg in messages if msg.get("content")]
 
-def send_message_to_llm(messages: List[Dict[str, str]], model_id: str) -> Tuple[str, Optional[Dict]]:
+def send_message_to_llm(messages: List[Dict[str, str]], model_id: str, selected_system_prompt: str = None) -> Tuple[str, Optional[Dict]]:
     """Send message to LLM API and get response with token usage"""
     try:
-        # Add user context to messages if available
+        # Build system message combining system prompt and user context
         enhanced_messages = messages.copy()
+        system_parts = []
+
+        # Add selected system prompt
+        if selected_system_prompt:
+            # Get the actual prompt text
+            if selected_system_prompt.startswith("Custom: "):
+                # Custom prompt
+                custom_name = selected_system_prompt[8:]  # Remove "Custom: " prefix
+                custom_prompts = get_preference("custom_system_prompts", {})
+                prompt_text = custom_prompts.get(custom_name, "")
+            else:
+                # Predefined prompt
+                prompt_text = get_prompt_by_display_name(selected_system_prompt)
+
+            if prompt_text:
+                system_parts.append(prompt_text)
+
+        # Add user context if available
         if current_user and hasattr(current_user, 'user_context') and current_user.user_context:
+            system_parts.append(f"User context: {current_user.user_context}")
+
+        # Create system message if we have any system content
+        if system_parts:
             system_message = {
                 "role": "system",
-                "content": f"User context: {current_user.user_context}"
+                "content": "\n\n".join(system_parts)
             }
             enhanced_messages = [system_message] + enhanced_messages
 
@@ -212,10 +235,10 @@ def load_conversations_list(search_query: str = "") -> List[Tuple[str, str]]:
 
         if search_query and search_query.strip():
             print(f"[CONV] Searching conversations with query: '{search_query}'")
-            conversations = db_service.search_conversations(search_query, limit=20, user_id=user_id)
+            conversations = db_service.search_conversations(search_query, limit=2000, user_id=user_id)
         else:
             print(f"[CONV] Loading recent conversations")
-            conversations = db_service.get_recent_conversations(limit=20, user_id=user_id)
+            conversations = db_service.get_recent_conversations(limit=2000, user_id=user_id)
 
         if not conversations:
             print(f"[CONV] No conversations found")
@@ -342,7 +365,29 @@ def update_model_selection_for_user() -> str:
 
     return None
 
-def chat_function(message: str, history: List[Dict[str, str]], model_choice: str, uploaded_files: List[Dict] = None) -> Tuple[str, List[Dict[str, str]], List[Dict], gr.update]:
+def update_system_prompt_selection_for_user() -> str:
+    """Update system prompt selection based on user's last used system prompt from recent conversations"""
+    global current_user, db_service
+
+    if not (AUTH_ENABLED and current_user and db_service):
+        return None
+
+    try:
+        # Get the last used system prompt name from user's conversation history
+        last_used_system_prompt = db_service.get_user_last_used_system_prompt_name(str(current_user.id))
+
+        if last_used_system_prompt:
+            print(f"[SYSTEM_PROMPT] Found last used system prompt for {current_user.username}: {last_used_system_prompt}")
+            return last_used_system_prompt
+        else:
+            print(f"[SYSTEM_PROMPT] No last used system prompt found for {current_user.username}, using default")
+
+    except Exception as e:
+        print(f"[SYSTEM_PROMPT] Error getting last used system prompt for {current_user.username}: {e}")
+
+    return "General Assistant"  # Default fallback
+
+def chat_function(message: str, history: List[Dict[str, str]], model_choice: str, system_prompt_choice: str, uploaded_files: List[Dict] = None) -> Tuple[str, List[Dict[str, str]], List[Dict], gr.update]:
     """Handle chat messages with optional file attachments"""
     global db_service, current_conversation_id, file_processor
 
@@ -408,7 +453,7 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
     # Create a temporary history with the file context message for the LLM
     temp_history = history + [{"role": "user", "content": llm_message}]
     openai_messages = messages_to_openai_format(temp_history)
-    response, usage = send_message_to_llm(openai_messages, model_id)
+    response, usage = send_message_to_llm(openai_messages, model_id, system_prompt_choice)
 
     # Update global token counter
     global current_conversation_tokens
@@ -422,7 +467,8 @@ def chat_function(message: str, history: List[Dict[str, str]], model_choice: str
     # Save assistant message to database
     if db_service and conversation_id:
         try:
-            db_service.save_message(conversation_id, "assistant", response, model_id)
+            db_service.save_message(conversation_id, "assistant", response, model_id,
+                                  system_prompt_name=system_prompt_choice)
         except Exception as e:
             print(f"Error saving assistant message: {e}")
 
@@ -690,29 +736,45 @@ def create_interface():
                                 admin_panel_btn = gr.Button("Admin Panel", variant="secondary", size="sm", visible=False)
                                 logout_btn = gr.Button("Logout", variant="secondary", size="sm")
                     with gr.Column(scale=3):
-                        # Model selection with free models toggle
-                        with gr.Row():
-                            with gr.Column(scale=6):
-                                # Get model choices and default to first available
-                                # Note: Proper last-used model will be set after user authentication
-                                model_choices = get_model_choices()
-                                default_model = model_choices[0] if model_choices != ["No models available"] else None
+                        # Model selection
+                        model_choices = get_model_choices()
+                        default_model = model_choices[0] if model_choices != ["No models available"] else None
 
-                                model_dropdown = gr.Dropdown(
-                                    choices=model_choices,
-                                    value=default_model,
-                                    label="Model",
-                                    interactive=True,
-                                    container=False
-                                )
-                            with gr.Column(scale=1, min_width=50):
-                                # Free models toggle - just an icon button
-                                free_models_toggle = gr.Checkbox(
-                                    label="🆓",
-                                    value=False,
-                                    container=False,
-                                    info="Show only free models"
-                                )
+                        model_dropdown = gr.Dropdown(
+                            choices=model_choices,
+                            value=default_model,
+                            label="Model",
+                            interactive=True,
+                            container=False
+                        )
+
+                        # System prompt selection - directly below model
+                        # Get system prompt choices (predefined + custom)
+                        def get_system_prompt_choices():
+                            predefined_names = get_display_names()
+                            custom_prompts = user_preferences.get("custom_system_prompts", {})
+                            custom_names = [f"Custom: {name}" for name in custom_prompts.keys()]
+                            return predefined_names + custom_names
+
+                        system_prompt_choices = get_system_prompt_choices()
+                        default_system_prompt = user_preferences.get("selected_system_prompt", "General Assistant")
+
+                        system_prompt_dropdown = gr.Dropdown(
+                            choices=system_prompt_choices,
+                            value=default_system_prompt if default_system_prompt in system_prompt_choices else "General Assistant",
+                            label="System Prompt",
+                            interactive=True,
+                            container=False,
+                            info="Select how the AI should behave",
+                            allow_custom_value=True
+                        )
+
+                        # Free models toggle - below system prompt selector
+                        free_models_toggle = gr.Checkbox(
+                            label="🆓 Show only free models",
+                            value=False,
+                            container=False
+                        )
 
                 # Token usage display
                 with gr.Row():
@@ -732,16 +794,19 @@ def create_interface():
                     show_copy_button=True
                 )
 
-                # Input area - full width message bar
+                # Input area - message bar with send button
                 with gr.Row():
                     msg_input = gr.Textbox(
                         placeholder="Message Local GPT...",
                         show_label=False,
-                        scale=1,
+                        scale=6,
                         container=False,
                         lines=2,
                         max_lines=4
                     )
+                    with gr.Column(scale=1):
+                        send_btn = gr.Button("Send", variant="primary", size="lg")
+                        clear_btn = gr.Button("Clear", variant="secondary", size="lg")
 
                 # File upload area and buttons row
                 with gr.Row():
@@ -760,8 +825,6 @@ def create_interface():
                             interactive=True
                         )
                     with gr.Column(scale=2):
-                        send_btn = gr.Button("Send", variant="primary", size="lg")
-                        clear_btn = gr.Button("Clear", variant="secondary", size="lg")
                         new_chat_btn = gr.Button("+ New Chat", variant="stop", size="lg")
 
                 # File status display
@@ -779,6 +842,39 @@ def create_interface():
                 # Model info in a collapsible section
                 with gr.Accordion("Model Information", open=False):
                     model_info = gr.Markdown("Select a model to see its description.")
+
+                # Custom Prompt Management
+                with gr.Accordion("🎯 Custom System Prompts", open=False):
+                    gr.HTML("<h4>Manage Custom System Prompts</h4>")
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            custom_prompt_name = gr.Textbox(
+                                label="Prompt Name",
+                                placeholder="Enter a name for your custom prompt",
+                                container=True
+                            )
+                            custom_prompt_text = gr.Textbox(
+                                label="System Prompt",
+                                placeholder="Enter your custom system prompt here...",
+                                lines=6,
+                                container=True,
+                                info="This will be sent to the AI to define its behavior and personality"
+                            )
+                            with gr.Row():
+                                save_custom_prompt_btn = gr.Button("💾 Save Prompt", variant="primary")
+                                delete_custom_prompt_btn = gr.Button("🗑️ Delete Selected", variant="stop")
+                            custom_prompt_message = gr.HTML("")
+
+                        with gr.Column(scale=1):
+                            gr.HTML("<h5>Your Custom Prompts</h5>")
+                            custom_prompts_list = gr.Dropdown(
+                                choices=[],
+                                label="Saved Custom Prompts",
+                                interactive=True,
+                                container=True,
+                                info="Select a prompt to edit or delete"
+                            )
+                            load_custom_prompt_btn = gr.Button("📝 Load for Editing", variant="secondary")
 
                 # User Profile Panel - visible when authenticated
                 profile_panel_visible = AUTH_ENABLED
@@ -1032,8 +1128,9 @@ def create_interface():
                 # Now regenerate from the user message
                 if new_history and new_history[-1]["role"] == "user":
                     model_id = extract_model_id(current_model_choice)
+                    current_system_prompt = get_preference("selected_system_prompt", "General Assistant")
                     openai_messages = messages_to_openai_format(new_history)
-                    response, _ = send_message_to_llm(openai_messages, model_id)
+                    response, _ = send_message_to_llm(openai_messages, model_id, current_system_prompt)
 
                     # Add new assistant response
                     assistant_message = {"role": "assistant", "content": response}
@@ -1177,6 +1274,82 @@ def create_interface():
             """Clear the user creation form"""
             return "", "", "", False, ""
 
+        # Custom Prompt Management Functions
+        def refresh_system_prompt_choices():
+            """Refresh system prompt dropdown choices"""
+            predefined_names = get_display_names()
+            custom_prompts = get_preference("custom_system_prompts", {})
+            custom_names = [f"Custom: {name}" for name in custom_prompts.keys()]
+            return predefined_names + custom_names
+
+        def save_custom_prompt(prompt_name: str, prompt_text: str) -> Tuple[str, str, List[str], str]:
+            """Save a custom system prompt"""
+            if not prompt_name or not prompt_name.strip():
+                return prompt_name, prompt_text, [], "❌ Please enter a prompt name."
+
+            if not prompt_text or not prompt_text.strip():
+                return prompt_name, prompt_text, [], "❌ Please enter the prompt text."
+
+            prompt_name = prompt_name.strip()
+            prompt_text = prompt_text.strip()
+
+            # Get current custom prompts
+            custom_prompts = get_preference("custom_system_prompts", {})
+
+            # Save the new prompt
+            custom_prompts[prompt_name] = prompt_text
+            success = set_preference("custom_system_prompts", custom_prompts)
+
+            if success:
+                # Update dropdown choices
+                custom_list_choices = list(custom_prompts.keys())
+                # Set the newly created custom prompt as selected
+                new_selected = f"Custom: {prompt_name}"
+                set_preference("selected_system_prompt", new_selected)
+                return "", "", custom_list_choices, f"✅ Custom prompt '{prompt_name}' saved successfully!"
+            else:
+                return prompt_name, prompt_text, [], "❌ Failed to save custom prompt."
+
+        def delete_custom_prompt(selected_prompt: str) -> Tuple[List[str], List[str], str]:
+            """Delete a selected custom prompt"""
+            if not selected_prompt:
+                return [], [], "❌ Please select a prompt to delete."
+
+            # Get current custom prompts
+            custom_prompts = get_preference("custom_system_prompts", {})
+
+            if selected_prompt in custom_prompts:
+                del custom_prompts[selected_prompt]
+                success = set_preference("custom_system_prompts", custom_prompts)
+
+                if success:
+                    # Update dropdown choices
+                    new_choices = refresh_system_prompt_choices()
+                    custom_list_choices = list(custom_prompts.keys())
+                    return new_choices, custom_list_choices, f"✅ Custom prompt '{selected_prompt}' deleted successfully!"
+                else:
+                    return [], [], "❌ Failed to delete custom prompt."
+            else:
+                return [], [], "❌ Selected prompt not found."
+
+        def load_custom_prompt_for_editing(selected_prompt: str) -> Tuple[str, str, str]:
+            """Load selected custom prompt for editing"""
+            if not selected_prompt:
+                return "", "", "❌ Please select a prompt to load."
+
+            # Get current custom prompts
+            custom_prompts = get_preference("custom_system_prompts", {})
+
+            if selected_prompt in custom_prompts:
+                prompt_text = custom_prompts[selected_prompt]
+                return selected_prompt, prompt_text, f"📝 Loaded '{selected_prompt}' for editing."
+            else:
+                return "", "", "❌ Selected prompt not found."
+
+        def update_system_prompt_selection(selected_prompt: str):
+            """Update selected system prompt preference"""
+            set_preference("selected_system_prompt", selected_prompt)
+
         # Profile Functions
         def load_user_profile():
             """Load current user's profile data"""
@@ -1317,7 +1490,7 @@ def create_interface():
 
         send_btn.click(
             chat_function,
-            inputs=[msg_input, chatbot, model_dropdown, uploaded_files_state],
+            inputs=[msg_input, chatbot, model_dropdown, system_prompt_dropdown, uploaded_files_state],
             outputs=[msg_input, chatbot, uploaded_files_state, uploaded_files_table]
         ).then(
             lambda search_query: gr.update(choices=load_conversations_list(search_query)),
@@ -1331,7 +1504,7 @@ def create_interface():
 
         msg_input.submit(
             chat_function,
-            inputs=[msg_input, chatbot, model_dropdown, uploaded_files_state],
+            inputs=[msg_input, chatbot, model_dropdown, system_prompt_dropdown, uploaded_files_state],
             outputs=[msg_input, chatbot, uploaded_files_state, uploaded_files_table]
         ).then(
             lambda search_query: gr.update(choices=load_conversations_list(search_query)),
@@ -1378,20 +1551,31 @@ def create_interface():
             if check_conversations_need_refresh():
                 print(f"[CONV] User context changed during conversation selection, refreshing")
                 # Don't select a conversation if user context changed - just refresh the list
-                return [], "", [], gr.update(visible=False, value=[])
+                return [], "", [], gr.update(visible=False, value=[]), "General Assistant"
 
             if selected:
                 global current_conversation_id, current_conversation_tokens
                 current_conversation_id = selected
                 current_conversation_tokens = 0  # Reset token counter for selected conversation
                 messages = load_conversation_messages(selected)
-                return messages, "", [], gr.update(visible=False, value=[])  # Clear search and uploaded files when selecting conversation
-            return [], "", [], gr.update(visible=False, value=[])
+
+                # Get the system prompt for this conversation
+                user_id = str(current_user.id) if current_user else None
+                conversation_system_prompt = "General Assistant"  # Default
+                if db_service and user_id:
+                    try:
+                        conversation_system_prompt = db_service.get_conversation_system_prompt_name(selected, user_id)
+                        print(f"[CONV] Loaded system prompt for conversation {selected}: {conversation_system_prompt}")
+                    except Exception as e:
+                        print(f"[CONV] Error loading system prompt for conversation: {e}")
+
+                return messages, "", [], gr.update(visible=False, value=[]), conversation_system_prompt  # Clear search and uploaded files when selecting conversation
+            return [], "", [], gr.update(visible=False, value=[]), "General Assistant"
 
         conversations_radio.change(
             handle_conversation_selection,
             inputs=[conversations_radio],
-            outputs=[chatbot, search_input, uploaded_files_state, uploaded_files_table]
+            outputs=[chatbot, search_input, uploaded_files_state, uploaded_files_table, system_prompt_dropdown]
         ).then(
             lambda: gr.update(choices=load_conversations_list("")),
             outputs=[conversations_radio]
@@ -1514,6 +1698,33 @@ def create_interface():
             outputs=[users_list]
         )
 
+        # System Prompt Event Handlers
+        system_prompt_dropdown.change(
+            update_system_prompt_selection,
+            inputs=[system_prompt_dropdown],
+            outputs=[]
+        )
+
+        save_custom_prompt_btn.click(
+            save_custom_prompt,
+            inputs=[custom_prompt_name, custom_prompt_text],
+            outputs=[custom_prompt_name, custom_prompt_text, custom_prompts_list, custom_prompt_message]
+        ).then(
+            lambda: gr.update(choices=refresh_system_prompt_choices(), value=get_preference("selected_system_prompt", "General Assistant")),
+            outputs=[system_prompt_dropdown]
+        )
+
+        delete_custom_prompt_btn.click(
+            delete_custom_prompt,
+            inputs=[custom_prompts_list],
+            outputs=[system_prompt_dropdown, custom_prompts_list, custom_prompt_message]
+        )
+
+        load_custom_prompt_btn.click(
+            load_custom_prompt_for_editing,
+            inputs=[custom_prompts_list],
+            outputs=[custom_prompt_name, custom_prompt_text, custom_prompt_message]
+        )
 
         # Initialize admin panel data on load
         def initialize_admin_panel():
@@ -1557,20 +1768,54 @@ def create_interface():
                 global current_model_choice
                 current_model_choice = default_model
 
+                # Initialize system prompt - use last used if authenticated user, otherwise default
+                if AUTH_ENABLED and current_user and db_service:
+                    try:
+                        last_used_system_prompt = update_system_prompt_selection_for_user()
+                        system_prompt_value = last_used_system_prompt or "General Assistant"
+                        print(f"[INIT] Setting system prompt for authenticated user: {system_prompt_value}")
+                    except Exception as e:
+                        print(f"[INIT] Error getting last used system prompt: {e}")
+                        system_prompt_value = "General Assistant"
+                else:
+                    system_prompt_value = get_preference("selected_system_prompt", "General Assistant")
+                    print(f"[INIT] Setting system prompt from preferences: {system_prompt_value}")
+
                 # Initialize admin panel if available
                 if AUTH_ENABLED and current_user and current_user.is_admin:
                     users_data, auth_text, sessions_text = initialize_admin_panel()
                 else:
                     users_data, auth_text, sessions_text = [], "", ""
 
+                # Initialize custom prompts list
+                custom_prompts = get_preference("custom_system_prompts", {})
+                custom_prompts_choices = list(custom_prompts.keys())
+
                 print(f"[INIT] Interface initialized with model and admin panel")
-                return conversations_update, model_info_text, token_display_text, users_data, auth_text, sessions_text
+                return conversations_update, model_info_text, token_display_text, users_data, auth_text, sessions_text, custom_prompts_choices, system_prompt_value
             else:
+                # Initialize system prompt - use last used if authenticated user, otherwise default
+                if AUTH_ENABLED and current_user and db_service:
+                    try:
+                        last_used_system_prompt = update_system_prompt_selection_for_user()
+                        system_prompt_value = last_used_system_prompt or "General Assistant"
+                        print(f"[INIT] Setting system prompt for authenticated user (no model): {system_prompt_value}")
+                    except Exception as e:
+                        print(f"[INIT] Error getting last used system prompt (no model): {e}")
+                        system_prompt_value = "General Assistant"
+                else:
+                    system_prompt_value = get_preference("selected_system_prompt", "General Assistant")
+                    print(f"[INIT] Setting system prompt from preferences (no model): {system_prompt_value}")
+
                 # Initialize admin panel if available
                 if AUTH_ENABLED and current_user and current_user.is_admin:
                     users_data, auth_text, sessions_text = initialize_admin_panel()
                 else:
                     users_data, auth_text, sessions_text = [], "", ""
+
+                # Initialize custom prompts list
+                custom_prompts = get_preference("custom_system_prompts", {})
+                custom_prompts_choices = list(custom_prompts.keys())
 
                 print(f"[INIT] Interface initialized without model")
                 return (
@@ -1579,21 +1824,23 @@ def create_interface():
                     "<div style='text-align: center; padding: 5px;'><span style='color: #666;'>Tokens: 0 / Unknown</span></div>",
                     users_data,
                     auth_text,
-                    sessions_text
+                    sessions_text,
+                    custom_prompts_choices,
+                    system_prompt_value
                 )
 
         # Setup demo load - always include admin panel outputs for consistency
         demo.load(
             initialize_interface,
             inputs=[],
-            outputs=[conversations_radio, model_info, token_usage_display, users_list, auth_status, active_sessions]
+            outputs=[conversations_radio, model_info, token_usage_display, users_list, auth_status, active_sessions, custom_prompts_list, system_prompt_dropdown]
         )
 
     # Return demo and user interface elements for wrapper access
     if AUTH_ENABLED:
-        return demo, user_display, logout_btn, conversations_radio, model_dropdown
+        return demo, user_display, logout_btn, conversations_radio, model_dropdown, system_prompt_dropdown
     else:
-        return demo, None, None, None, None
+        return demo, None, None, None, None, None
 
 def initialize_app():
     """Initialize application globals - called both by main() and when imported for Gradio CLI"""
@@ -1695,7 +1942,7 @@ def create_app():
         login_demo, login_success, session_token = create_login_interface()
 
         # Create main chat interface
-        chat_demo, user_display, logout_btn, conversations_radio, model_dropdown = create_interface()
+        chat_demo, user_display, logout_btn, conversations_radio, model_dropdown, system_prompt_dropdown = create_interface()
 
         # Create wrapper that shows login or chat based on authentication
         with gr.Blocks(title="Local GPT Chat") as app:
@@ -1783,8 +2030,8 @@ def create_app():
                 return gr.update(choices=load_conversations_list(""))
 
             def refresh_conversations_and_model_after_auth():
-                """Refresh conversation list and update model selection after authentication events"""
-                print(f"[AUTH] Refreshing conversations and model after authentication event")
+                """Refresh conversation list and update model/system prompt selection after authentication events"""
+                print(f"[AUTH] Refreshing conversations, model, and system prompt after authentication event")
 
                 # Refresh conversations
                 conversations_update = gr.update(choices=load_conversations_list(""))
@@ -1796,7 +2043,14 @@ def create_app():
                 else:
                     model_update = gr.update()  # No change if no last used model found
 
-                return conversations_update, model_update
+                # Update system prompt selection for the authenticated user
+                last_used_system_prompt = update_system_prompt_selection_for_user()
+                if last_used_system_prompt:
+                    system_prompt_update = gr.update(value=last_used_system_prompt)
+                else:
+                    system_prompt_update = gr.update(value="General Assistant")  # Default fallback
+
+                return conversations_update, model_update, system_prompt_update
 
             # Monitor login success and sync states
             login_success.change(
@@ -1806,7 +2060,7 @@ def create_app():
             ).then(
                 refresh_conversations_and_model_after_auth,
                 inputs=[],
-                outputs=[conversations_radio, model_dropdown]
+                outputs=[conversations_radio, model_dropdown, system_prompt_dropdown]
             )
 
             # Logout handler at wrapper level
@@ -1859,7 +2113,7 @@ def create_app():
             ).then(
                 refresh_conversations_and_model_after_auth,
                 inputs=[],
-                outputs=[conversations_radio, model_dropdown]
+                outputs=[conversations_radio, model_dropdown, system_prompt_dropdown]
             )
 
             # Also listen for session state changes for manual restoration
@@ -1870,13 +2124,13 @@ def create_app():
             ).then(
                 refresh_conversations_and_model_after_auth,
                 inputs=[],
-                outputs=[conversations_radio, model_dropdown]
+                outputs=[conversations_radio, model_dropdown, system_prompt_dropdown]
             )
 
         return app
     else:
         # No authentication - return main interface directly
-        demo, _, _, _, _ = create_interface()
+        demo, _, _, _, _, _ = create_interface()
         return demo
 
 def main():

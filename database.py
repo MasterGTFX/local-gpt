@@ -423,3 +423,60 @@ class DatabaseService:
                 return last_assistant_message.model
 
             return None
+
+    def get_user_last_used_system_prompt_name(self, user_id: str) -> Optional[str]:
+        """Get the system prompt display name from the user's most recent assistant message"""
+        if not user_id:
+            return None
+
+        with self.get_session() as session:
+            # Get the most recent conversation for this user
+            recent_conversation = session.query(Conversation).filter(
+                Conversation.user_id == user_id
+            ).order_by(Conversation.updated_at.desc()).first()
+
+            if not recent_conversation:
+                return None
+
+            # Get the most recent assistant message from that conversation
+            last_assistant_message = session.query(Message).filter(
+                Message.conversation_id == recent_conversation.id,
+                Message.message_data['role'].astext == 'assistant'
+            ).order_by(Message.created_at.desc()).first()
+
+            if last_assistant_message and last_assistant_message.message_data.get('metadata'):
+                metadata = last_assistant_message.message_data.get('metadata', {})
+                system_prompt_name = metadata.get('system_prompt_name')
+                if system_prompt_name:
+                    return system_prompt_name
+
+            return "General Assistant"  # Default fallback
+
+    def get_conversation_system_prompt_name(self, conversation_id: str, user_id: str = None) -> Optional[str]:
+        """Get the system prompt display name from the first assistant message in a conversation"""
+        if not conversation_id:
+            return None
+
+        with self.get_session() as session:
+            # Verify conversation belongs to user if user_id provided
+            if user_id:
+                conversation = session.query(Conversation).filter(
+                    Conversation.id == conversation_id,
+                    Conversation.user_id == user_id
+                ).first()
+                if not conversation:
+                    return None
+
+            # Get the first assistant message from this conversation
+            first_assistant_message = session.query(Message).filter(
+                Message.conversation_id == conversation_id,
+                Message.message_data['role'].astext == 'assistant'
+            ).order_by(Message.created_at.asc()).first()
+
+            if first_assistant_message and first_assistant_message.message_data.get('metadata'):
+                metadata = first_assistant_message.message_data.get('metadata', {})
+                system_prompt_name = metadata.get('system_prompt_name')
+                if system_prompt_name:
+                    return system_prompt_name
+
+            return "General Assistant"  # Default fallback
